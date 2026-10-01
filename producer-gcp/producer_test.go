@@ -491,7 +491,10 @@ func TestResultRouteFilterTooLong(t *testing.T) {
 }
 
 func TestNewProducerRequiresContext(t *testing.T) {
-	_, err := NewProducer(nil, testConfig())
+	// A nil variable, not a nil literal, so staticcheck SA1012 stays quiet.
+	// NewProducer still has to reject it.
+	var ctx context.Context
+	_, err := NewProducer(ctx, testConfig())
 	if err == nil || !strings.Contains(err.Error(), "context") {
 		t.Fatalf("error = %v, want context required", err)
 	}
