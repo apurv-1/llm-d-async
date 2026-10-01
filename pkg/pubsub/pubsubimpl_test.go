@@ -499,16 +499,18 @@ func (m *mockDropGate) Apply(ctx context.Context, msg *api.InternalRequest, rele
 	return pipeline.Drop(m.result), nil
 }
 
-// TestProcessMessages_DropResultKeepsResultRoute is the regression guard for a
-// gate-provided drop result carrying no request metadata (the
-// tier-priority-admission gate builds one): without the route the result
-// publishes attribute-less, a filtered result subscription never sees it, and
-// the producer hangs while its request is already acked.
-func TestProcessMessages_DropResultKeepsResultRoute(t *testing.T) {
+// TestProcessMessages_DropForwardsGateMetadata checks that a drop result is
+// queued with the metadata the gate set. The transport does not copy
+// result_route off the request; gates that need it put it on the result.
+func TestProcessMessages_DropForwardsGateMetadata(t *testing.T) {
 	flow := &PubSubMQFlow{resultChannel: make(chan api.ResultMessage, 1)}
 	ch := make(chan *api.InternalRequest, 1)
 
-	gate := &mockDropGate{result: &api.ResultMessage{ID: "test-msg", Payload: `{"code":429}`}}
+	gate := &mockDropGate{result: &api.ResultMessage{
+		ID:       "test-msg",
+		Payload:  `{"code":429}`,
+		Metadata: map[string]string{"userid": "alice"},
+	}}
 
 	msgData, _ := json.Marshal(api.RequestMessage{ID: "test-msg"})
 	receive := func(ctx context.Context, f func(context.Context, *pubsub.Message)) error {
@@ -541,8 +543,11 @@ func TestProcessMessages_DropResultKeepsResultRoute(t *testing.T) {
 	defer func() {
 		_ = recover()
 		<-done
-		if got.Metadata[api.ResultRouteAttribute] != "producer-a" {
-			t.Fatalf("drop result metadata = %v, want result_route=producer-a", got.Metadata)
+		if got.Metadata["userid"] != "alice" {
+			t.Fatalf("drop result metadata = %v, want userid=alice", got.Metadata)
+		}
+		if _, ok := got.Metadata[api.ResultRouteAttribute]; ok {
+			t.Fatalf("transport added result_route to drop metadata: %v", got.Metadata)
 		}
 	}()
 
