@@ -1152,6 +1152,9 @@ Each producer attaches a filtered result subscription so it only sees its own re
 
 By default `NewProducer` idempotently creates the request topic, the request subscription (exactly-once, exponential backoff, DLQ, never-expire), the result topic, this producer's filtered result subscription (never-expire), and a DLQ topic plus subscription.
 `AlreadyExists` is success after checking that an existing subscription is attached to the expected topic (and, for the result subscription, that the filter matches).
+It does not change the expiration policy.
+A subscription created with an inactivity TTL keeps that TTL.
+Delete it once so the next `NewProducer` creates it with no expiry.
 Use `WithoutCreateResources` for a publish-only identity.
 See [docs/proposals/gcp-pubsub-producer.md](docs/proposals/gcp-pubsub-producer.md).
 

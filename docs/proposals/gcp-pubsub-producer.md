@@ -99,8 +99,10 @@ With no deadline, provisioning stops after 30s.
 - Topic: treat as success.
 - Subscription: `GetSubscription` and fail if `topic` does not match.
 - Result subscription: also fail if `filter` does not match.
-- Other settings (exactly-once, retry, DLQ, ack deadline) are not mutated on an existing subscription.
+- Other settings (exactly-once, retry, DLQ, ack deadline, expiration) are not mutated on an existing subscription.
   Operators who created the processor subscription by hand keep their values.
+  A subscription created with an inactivity TTL keeps that TTL.
+  Delete it once so the next `NewProducer` creates it with no expiry.
 
 ### DLQ IAM
 
