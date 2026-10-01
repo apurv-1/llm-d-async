@@ -20,7 +20,7 @@ import (
 
 const testProject = "test-project"
 
-func newFakeClient(t *testing.T) *pubsub.Client {
+func newFake(t *testing.T) (*pubsub.Client, *pstest.Server) {
 	t.Helper()
 	srv := pstest.NewServer()
 	t.Cleanup(func() { _ = srv.Close() })
@@ -34,6 +34,12 @@ func newFakeClient(t *testing.T) *pubsub.Client {
 		t.Fatalf("create fake pubsub client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
+	return client, srv
+}
+
+func newFakeClient(t *testing.T) *pubsub.Client {
+	t.Helper()
+	client, _ := newFake(t)
 	return client
 }
 
@@ -551,4 +557,91 @@ func TestCloseDuringCallsDoesNotPanic(t *testing.T) {
 		t.Errorf("Close: %v", err)
 	}
 	wg.Wait()
+}
+
+func resultRouteStats(srv *pstest.Server, route string) (acked, delivered int) {
+	for _, msg := range srv.Messages() {
+		if msg.Attributes[api.ResultRouteAttribute] != route {
+			continue
+		}
+		if msg.Deliveries > 0 {
+			delivered++
+		}
+		if msg.Acks > 0 {
+			acked++
+		}
+	}
+	return acked, delivered
+}
+
+func TestGetResultAcksOnlyTheHandoff(t *testing.T) {
+	client, srv := newFake(t)
+	p := newTestProducer(t, client, testConfig())
+	publishResult(t, client, "results", "one", "producer-a")
+	publishResult(t, client, "results", "two", "producer-a")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := p.GetResult(ctx)
+	if err != nil {
+		t.Fatalf("GetResult: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		acked, delivered := resultRouteStats(srv, "producer-a")
+		if delivered >= 2 && acked == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivered=%d acked=%d, want both pulled and only %q acked", delivered, acked, got.ID)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	p2 := newTestProducer(t, client, testConfig())
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	other, err := p2.GetResult(ctx2)
+	if err != nil {
+		t.Fatalf("redelivered GetResult: %v", err)
+	}
+	if other.ID == got.ID {
+		t.Fatalf("redelivered %q, which was already handed off", other.ID)
+	}
+}
+
+func TestPoisonResultIsAcked(t *testing.T) {
+	client, srv := newFake(t)
+	p := newTestProducer(t, client, testConfig())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	publisher := client.Publisher("results")
+	t.Cleanup(func() { publisher.Stop() })
+	if _, err := publisher.Publish(ctx, &pubsub.Message{
+		Data:       []byte("not-json"),
+		Attributes: map[string]string{api.ResultRouteAttribute: "producer-a"},
+	}).Get(ctx); err != nil {
+		t.Fatalf("publish poison: %v", err)
+	}
+
+	_, err := p.GetResult(ctx)
+	if err == nil || !strings.Contains(err.Error(), "unmarshal") {
+		t.Fatalf("GetResult = %v, want unmarshal error", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		acked, _ := resultRouteStats(srv, "producer-a")
+		if acked == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("poison acks = %d, want 1", acked)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
