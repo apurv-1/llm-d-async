@@ -19,7 +19,6 @@ type subscriptionSpec struct {
 	retry              bool
 	deadLetterTopicID  string
 	neverExpire        bool
-	expiration         *durationpb.Duration
 }
 
 func (p *Producer) ensureResources(ctx context.Context) error {
@@ -57,7 +56,7 @@ func (p *Producer) ensureResources(ctx context.Context) error {
 		topicID:            p.resultTopicID,
 		filter:             resultRouteFilter(p.resultRoute),
 		ackDeadlineSeconds: resultAckDeadlineSeconds,
-		expiration:         durationpb.New(defaultResultSubscriptionExpiry),
+		neverExpire:        true,
 	}
 	return p.ensureSubscription(ctx, resultSub)
 }
@@ -119,8 +118,6 @@ func (spec subscriptionSpec) toProto(project, name, topic string) *pubsubpb.Subs
 	}
 	if spec.neverExpire {
 		sub.ExpirationPolicy = &pubsubpb.ExpirationPolicy{}
-	} else if spec.expiration != nil {
-		sub.ExpirationPolicy = &pubsubpb.ExpirationPolicy{Ttl: spec.expiration}
 	}
 	return sub
 }

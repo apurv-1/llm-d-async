@@ -50,7 +50,7 @@ func testConfig() Config {
 func newTestProducer(t *testing.T, client *pubsub.Client, cfg Config, opts ...Option) *Producer {
 	t.Helper()
 	opts = append([]Option{WithPubSubClient(client)}, opts...)
-	p, err := NewProducer(cfg, opts...)
+	p, err := NewProducer(context.Background(), cfg, opts...)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestNewProducerValidatesConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := testConfig()
 			tt.mut(&cfg)
-			_, err := NewProducer(cfg, WithPubSubClient(client))
+			_, err := NewProducer(context.Background(), cfg, WithPubSubClient(client))
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -189,11 +189,8 @@ func TestNewProducerCreatesResources(t *testing.T) {
 	if resSub.GetFilter() != wantFilter {
 		t.Errorf("result filter = %q, want %q", resSub.GetFilter(), wantFilter)
 	}
-	if resSub.GetExpirationPolicy() == nil || resSub.GetExpirationPolicy().GetTtl() == nil {
-		t.Fatal("result subscription missing expiration TTL")
-	}
-	if resSub.GetExpirationPolicy().GetTtl().AsDuration() != defaultResultSubscriptionExpiry {
-		t.Errorf("result expiration = %v, want %v", resSub.GetExpirationPolicy().GetTtl().AsDuration(), defaultResultSubscriptionExpiry)
+	if resSub.GetExpirationPolicy() == nil || resSub.GetExpirationPolicy().GetTtl() != nil {
+		t.Errorf("result subscription should never expire, got %+v", resSub.GetExpirationPolicy())
 	}
 
 	if _, err := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
@@ -219,7 +216,7 @@ func TestNewProducerRejectsTopicMismatch(t *testing.T) {
 		t.Fatalf("create mismatched sub: %v", err)
 	}
 
-	_, err := NewProducer(testConfig(), WithPubSubClient(client))
+	_, err := NewProducer(context.Background(), testConfig(), WithPubSubClient(client))
 	if err == nil {
 		t.Fatal("expected topic mismatch error")
 	}
@@ -243,7 +240,7 @@ func TestNewProducerRejectsFilterMismatch(t *testing.T) {
 		t.Fatalf("create mismatched result sub: %v", err)
 	}
 
-	_, err := NewProducer(cfg, WithPubSubClient(client))
+	_, err := NewProducer(context.Background(), cfg, WithPubSubClient(client))
 	if err == nil {
 		t.Fatal("expected filter mismatch error")
 	}
@@ -265,11 +262,8 @@ func TestSubmitRequestPublishesPlainMessage(t *testing.T) {
 	}
 
 	msg := receiveOne(t, client, "request-sub", 5*time.Second)
-	if msg.Attributes[api.ResultRouteAttribute] != "producer-a" {
-		t.Errorf("attributes = %v, want result_route=producer-a", msg.Attributes)
-	}
-	if msg.Attributes["userid"] != "alice" {
-		t.Errorf("caller metadata not copied: %v", msg.Attributes)
+	if len(msg.Attributes) != 1 || msg.Attributes[api.ResultRouteAttribute] != "producer-a" {
+		t.Errorf("attributes = %v, want only result_route=producer-a", msg.Attributes)
 	}
 
 	var body map[string]any
@@ -281,6 +275,10 @@ func TestSubmitRequestPublishesPlainMessage(t *testing.T) {
 	}
 	if body["id"] != "req-1" {
 		t.Errorf("id = %v, want req-1", body["id"])
+	}
+	meta, _ := body["metadata"].(map[string]any)
+	if meta["userid"] != "alice" {
+		t.Errorf("body metadata = %v, want userid=alice", body["metadata"])
 	}
 }
 
@@ -350,9 +348,8 @@ func TestSubmitRequestRejectsTypedNil(t *testing.T) {
 	}
 }
 
-// TestGetResultCancelledCallerDoesNotWaitBehindReceive guards the
-// context-aware receive slot: a second GetResult with a deadline must not
-// block behind an in-flight Receive until that call finishes.
+// TestGetResultCancelledCallerDoesNotWaitBehindReceive checks that a second
+// GetResult returns on its own deadline while another call is waiting.
 func TestGetResultCancelledCallerDoesNotWaitBehindReceive(t *testing.T) {
 	client := newFakeClient(t)
 	p := newTestProducer(t, client, testConfig())
@@ -433,4 +430,125 @@ func TestSubmitAndGetResultRoundTrip(t *testing.T) {
 	if result.ID != "round-trip" {
 		t.Errorf("result id = %q, want round-trip", result.ID)
 	}
+}
+
+func TestGetResultDrainsSeveralResults(t *testing.T) {
+	client := newFakeClient(t)
+	p := newTestProducer(t, client, testConfig())
+
+	publishResult(t, client, "results", "one", "producer-a")
+	publishResult(t, client, "results", "two", "producer-a")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got := map[string]bool{}
+	for range 2 {
+		result, err := p.GetResult(ctx)
+		if err != nil {
+			t.Fatalf("GetResult: %v", err)
+		}
+		got[result.ID] = true
+	}
+	if !got["one"] || !got["two"] {
+		t.Errorf("results = %v, want one and two", got)
+	}
+}
+
+func TestResultRouteWithExplicitSubscriptionID(t *testing.T) {
+	client := newFakeClient(t)
+	cfg := testConfig()
+	cfg.ResultRoute = "tenant:42"
+	cfg.ResultSubscriptionID = "tenant-42-results"
+	p := newTestProducer(t, client, cfg)
+
+	ctx := context.Background()
+	resSub, err := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
+		Subscription: subscriptionResource(testProject, "tenant-42-results"),
+	})
+	if err != nil {
+		t.Fatalf("get result subscription: %v", err)
+	}
+	if resSub.GetFilter() != resultRouteFilter(p.resultRoute) {
+		t.Errorf("filter = %q", resSub.GetFilter())
+	}
+}
+
+func TestResultRouteFilterTooLong(t *testing.T) {
+	client := newFakeClient(t)
+	cfg := testConfig()
+	cfg.ResultRoute = strings.Repeat("a", 300)
+	cfg.ResultSubscriptionID = "tenant-results"
+	_, err := NewProducer(context.Background(), cfg, WithPubSubClient(client))
+	if err == nil || !strings.Contains(err.Error(), "256") {
+		t.Fatalf("error = %v, want filter length limit", err)
+	}
+}
+
+func TestNewProducerRequiresContext(t *testing.T) {
+	_, err := NewProducer(nil, testConfig())
+	if err == nil || !strings.Contains(err.Error(), "context") {
+		t.Fatalf("error = %v, want context required", err)
+	}
+}
+
+func TestProvisionContextUsesCallerDeadline(t *testing.T) {
+	parent, stop := context.WithTimeout(context.Background(), time.Hour)
+	defer stop()
+	ctx, cancel := provisionContext(parent)
+	defer cancel()
+	got, ok := ctx.Deadline()
+	want, _ := parent.Deadline()
+	if !ok || !got.Equal(want) {
+		t.Fatalf("deadline = %v ok=%v, want the caller deadline %v", got, ok, want)
+	}
+
+	ctx, cancel = provisionContext(context.Background())
+	defer cancel()
+	got, ok = ctx.Deadline()
+	if !ok {
+		t.Fatal("expected default deadline")
+	}
+	remaining := time.Until(got)
+	if remaining > newProducerTimeout || remaining < newProducerTimeout-time.Second {
+		t.Fatalf("default deadline remaining = %v, want about %v", remaining, newProducerTimeout)
+	}
+}
+
+func TestCloseThenUse(t *testing.T) {
+	client := newFakeClient(t)
+	p := newTestProducer(t, client, testConfig())
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := p.SubmitRequest(context.Background(), validRequest("after-close")); !errors.Is(err, errProducerClosed) {
+		t.Fatalf("SubmitRequest after Close = %v, want closed", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := p.GetResult(ctx); !errors.Is(err, errProducerClosed) {
+		t.Fatalf("GetResult after Close = %v, want closed", err)
+	}
+}
+
+func TestCloseDuringCallsDoesNotPanic(t *testing.T) {
+	client := newFakeClient(t)
+	p := newTestProducer(t, client, testConfig())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = p.SubmitRequest(context.Background(), validRequest("req-close"))
+	}()
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, _ = p.GetResult(ctx)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := p.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	wg.Wait()
 }
