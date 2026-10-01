@@ -106,7 +106,7 @@ var _ = ginkgo.Describe("GCP PubSub Integration", func() {
 		const route = "producer-gcp-e2e"
 		deletePubSubSubscription(ctx, pubsubClient, pubsubProjectID, route)
 
-		p, err := producergcp.NewProducer(producergcp.Config{
+		p, err := producergcp.NewProducer(ctx, producergcp.Config{
 			ProjectID:             pubsubProjectID,
 			RequestTopicID:        pubsubRequestTopic,
 			RequestSubscriptionID: pubsubRequestSub,

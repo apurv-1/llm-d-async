@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/pubsub/v2"
@@ -14,16 +15,19 @@ import (
 )
 
 const (
-	newProducerTimeout              = 30 * time.Second
-	requestAckDeadlineSeconds       = 600
-	resultAckDeadlineSeconds        = 60
-	maxDeliveryAttempts             = 5
-	minRetryBackoff                 = 10 * time.Second
-	maxRetryBackoff                 = 600 * time.Second
-	defaultResultSubscriptionExpiry = 7 * 24 * time.Hour
-	minPubSubResourceIDLen          = 3
-	maxPubSubResourceIDLen          = 255
+	newProducerTimeout        = 30 * time.Second
+	requestAckDeadlineSeconds = 600
+	resultAckDeadlineSeconds  = 60
+	maxDeliveryAttempts       = 5
+	minRetryBackoff           = 10 * time.Second
+	maxRetryBackoff           = 600 * time.Second
+	minPubSubResourceIDLen    = 3
+	maxPubSubResourceIDLen    = 255
+	maxSubscriptionFilterLen  = 256
+	resultReceiveBuffer       = 16
 )
+
+var errProducerClosed = errors.New("producer is closed")
 
 var _ api.Producer = (*Producer)(nil)
 
@@ -45,7 +49,8 @@ type Config struct {
 	// producer's result subscription. Required.
 	ResultRoute string
 
-	// ResultSubscriptionID is the result subscription ID. Defaults to ResultRoute.
+	// ResultSubscriptionID is the result subscription ID. Defaults to ResultRoute,
+	// which must then be a valid Pub/Sub resource ID.
 	// Producers that share ResultRoute and ResultSubscriptionID compete on one
 	// subscription. Distinct subscription IDs with the same route each get a copy.
 	ResultSubscriptionID string
@@ -95,21 +100,37 @@ type Producer struct {
 	deadLetterTopicID        string
 	deadLetterSubscriptionID string
 	createResources          bool
-	// receiveSlot serializes GetResult calls: Pub/Sub allows a single Receive
-	// per subscriber client. A one-permit channel (not a mutex) lets a caller
-	// with an expired context bail out instead of blocking behind an in-flight
-	// Receive.
-	receiveSlot chan struct{}
+	// results is filled by one Receive, started on the first GetResult.
+	results    chan receivedResult
+	recvOnce   sync.Once
+	recvCtx    context.Context
+	recvCancel context.CancelFunc
+	recvWG     sync.WaitGroup
+	recvMu     sync.Mutex
+	recvErr    error
+	closeOnce  sync.Once
+	closed     chan struct{}
 }
 
-// NewProducer creates a Pub/Sub producer. By default it idempotently creates
-// the request topic, request subscription, result topic, this producer's
-// filtered result subscription, and a DLQ topic plus subscription.
-func NewProducer(cfg Config, opts ...Option) (*Producer, error) {
+type receivedResult struct {
+	result *api.ResultMessage
+	err    error
+}
+
+// NewProducer creates a Pub/Sub producer. ctx bounds resource provisioning.
+// When ctx has no deadline, provisioning stops after 30s.
+// By default it idempotently creates the request topic, request subscription,
+// result topic, this producer's filtered result subscription, and a DLQ topic
+// plus subscription. None of those subscriptions expire.
+func NewProducer(ctx context.Context, cfg Config, opts ...Option) (*Producer, error) {
+	if ctx == nil {
+		return nil, errors.New("context is required")
+	}
 	if err := validateConfig(&cfg); err != nil {
 		return nil, err
 	}
 
+	recvCtx, recvCancel := context.WithCancel(context.Background())
 	p := &Producer{
 		projectID:                cfg.ProjectID,
 		requestTopicID:           cfg.RequestTopicID,
@@ -120,8 +141,18 @@ func NewProducer(cfg Config, opts ...Option) (*Producer, error) {
 		deadLetterTopicID:        cfg.DeadLetterTopicID,
 		deadLetterSubscriptionID: cfg.DeadLetterSubscriptionID,
 		createResources:          true,
-		receiveSlot:              make(chan struct{}, 1),
+		results:                  make(chan receivedResult, resultReceiveBuffer),
+		recvCtx:                  recvCtx,
+		recvCancel:               recvCancel,
+		closed:                   make(chan struct{}),
 	}
+
+	opened := false
+	defer func() {
+		if !opened {
+			_ = p.Close()
+		}
+	}()
 
 	for _, opt := range opts {
 		if err := opt(p); err != nil {
@@ -129,11 +160,11 @@ func NewProducer(cfg Config, opts ...Option) (*Producer, error) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), newProducerTimeout)
+	provisionCtx, cancel := provisionContext(ctx)
 	defer cancel()
 
 	if p.client == nil {
-		client, err := pubsub.NewClient(ctx, cfg.ProjectID)
+		client, err := pubsub.NewClient(provisionCtx, cfg.ProjectID)
 		if err != nil {
 			return nil, fmt.Errorf("create pubsub client: %w", err)
 		}
@@ -142,21 +173,30 @@ func NewProducer(cfg Config, opts ...Option) (*Producer, error) {
 	}
 
 	if p.createResources {
-		if err := p.ensureResources(ctx); err != nil {
-			_ = p.Close()
+		if err := p.ensureResources(provisionCtx); err != nil {
 			return nil, err
 		}
 	}
 
 	p.publisher = p.client.Publisher(p.requestTopicID)
+	opened = true
 	return p, nil
 }
 
-// SubmitRequest publishes a plain RequestMessage. Caller metadata is copied to
-// message attributes and result_route is set to this producer's configured route.
+// provisionContext uses the caller's deadline when one is set.
+// Otherwise it limits provisioning to newProducerTimeout.
+func provisionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, newProducerTimeout)
+}
+
+// SubmitRequest publishes a plain RequestMessage. Caller metadata stays in the
+// body. The only message attribute is result_route, set to this producer's route.
 func (p *Producer) SubmitRequest(ctx context.Context, req api.Request) error {
-	if p.publisher == nil {
-		return errors.New("producer is closed")
+	if err := p.errIfClosed(); err != nil {
+		return err
 	}
 	// An interface holding a typed nil (e.g. (*api.RequestMessage)(nil)) passes
 	// a plain nil check but panics in the accessors below.
@@ -190,7 +230,7 @@ func (p *Producer) SubmitRequest(ctx context.Context, req api.Request) error {
 
 	_, err = p.publisher.Publish(ctx, &pubsub.Message{
 		Data:       data,
-		Attributes: requestAttributes(req.ReqMetadata(), p.resultRoute),
+		Attributes: map[string]string{api.ResultRouteAttribute: p.resultRoute},
 	}).Get(ctx)
 	if err != nil {
 		return fmt.Errorf("publish request: %w", err)
@@ -208,81 +248,134 @@ func (p *Producer) CancelRequests(_ context.Context, requestIDs []string) error 
 }
 
 // GetResult blocks until a result matching this producer's result_route is
-// delivered or ctx is cancelled. Concurrent GetResult calls on the same
-// Producer are serialized.
+// delivered or ctx is cancelled. The first call starts one Receive for the
+// life of the producer. Later calls drain that stream.
 func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
-	if p.publisher == nil || p.client == nil {
-		return nil, errors.New("producer is closed")
-	}
-
-	select {
-	case p.receiveSlot <- struct{}{}:
-		defer func() { <-p.receiveSlot }()
-	case <-ctx.Done():
-		return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
-	}
-
-	sub := p.client.Subscriber(p.resultSubscriptionID)
-	sub.ReceiveSettings.MaxOutstandingMessages = 1
-	sub.ReceiveSettings.NumGoroutines = 1
-
-	recvCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var (
-		result   *api.ResultMessage
-		parseErr error
-	)
-	err := sub.Receive(recvCtx, func(_ context.Context, msg *pubsub.Message) {
-		var r api.ResultMessage
-		if uerr := json.Unmarshal(msg.Data, &r); uerr != nil {
-			msg.Ack()
-			parseErr = fmt.Errorf("unmarshal result: %w", uerr)
-			cancel()
-			return
-		}
-		if r.ID == "" {
-			msg.Ack()
-			parseErr = errors.New("result missing 'id' field")
-			cancel()
-			return
-		}
-		result = &r
-		msg.Ack()
-		cancel()
-	})
-	if result != nil {
-		return result, nil
-	}
-	if parseErr != nil {
-		return nil, parseErr
-	}
-	if err != nil && !errors.Is(err, context.Canceled) {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
-		}
-		return nil, fmt.Errorf("failed to get result: %w", err)
-	}
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
 	}
-	return nil, errors.New("failed to get result: receive ended without a message")
+	if err := p.errIfClosed(); err != nil {
+		return nil, err
+	}
+	p.startReceive()
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
+	case <-p.closed:
+		return nil, errProducerClosed
+	case item, ok := <-p.results:
+		if !ok {
+			return nil, p.resultStreamErr()
+		}
+		if item.err != nil {
+			return nil, item.err
+		}
+		return item.result, nil
+	}
 }
 
-// Close stops the publisher and, when the producer owns the client, closes it.
-func (p *Producer) Close() error {
-	if p.publisher != nil {
-		p.publisher.Stop()
-		p.publisher = nil
-	}
-	if p.managedClient && p.client != nil {
-		err := p.client.Close()
-		p.client = nil
-		if err != nil {
-			return fmt.Errorf("close pubsub client: %w", err)
+func (p *Producer) startReceive() {
+	p.recvOnce.Do(func() {
+		p.recvMu.Lock()
+		defer p.recvMu.Unlock()
+		select {
+		case <-p.closed:
+			return
+		default:
 		}
+		p.recvWG.Add(1)
+		go p.receiveResults(p.recvCtx)
+	})
+}
+
+func (p *Producer) receiveResults(ctx context.Context) {
+	defer p.recvWG.Done()
+	defer close(p.results)
+
+	sub := p.client.Subscriber(p.resultSubscriptionID)
+	sub.ReceiveSettings.MaxOutstandingMessages = resultReceiveBuffer
+	sub.ReceiveSettings.NumGoroutines = 1
+	err := sub.Receive(ctx, p.enqueueResult)
+	if err != nil && ctx.Err() == nil {
+		p.recvMu.Lock()
+		p.recvErr = err
+		p.recvMu.Unlock()
 	}
-	return nil
+}
+
+func (p *Producer) enqueueResult(ctx context.Context, msg *pubsub.Message) {
+	item := decodeResult(msg)
+	if item.err != nil {
+		msg.Ack()
+		select {
+		case p.results <- item:
+		case <-ctx.Done():
+		}
+		return
+	}
+	select {
+	case p.results <- item:
+		msg.Ack()
+	case <-ctx.Done():
+		msg.Nack()
+	}
+}
+
+func decodeResult(msg *pubsub.Message) receivedResult {
+	var result api.ResultMessage
+	if err := json.Unmarshal(msg.Data, &result); err != nil {
+		return receivedResult{err: fmt.Errorf("unmarshal result: %w", err)}
+	}
+	if result.ID == "" {
+		return receivedResult{err: errors.New("result missing 'id' field")}
+	}
+	return receivedResult{result: &result}
+}
+
+func (p *Producer) resultStreamErr() error {
+	if err := p.errIfClosed(); err != nil {
+		return err
+	}
+	p.recvMu.Lock()
+	err := p.recvErr
+	p.recvMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("failed to get result: %w", err)
+	}
+	return errors.New("failed to get result: receive ended without a message")
+}
+
+func (p *Producer) errIfClosed() error {
+	select {
+	case <-p.closed:
+		return errProducerClosed
+	default:
+		return nil
+	}
+}
+
+// Close stops the result receive and the publisher. When the producer owns
+// the client, it closes that too. The fields stay set so a call racing with
+// Close fails on the stopped publisher or the closed producer.
+func (p *Producer) Close() error {
+	var err error
+	p.closeOnce.Do(func() {
+		p.recvMu.Lock()
+		p.recvCancel()
+		close(p.closed)
+		p.recvMu.Unlock()
+		p.recvWG.Wait()
+		if p.publisher != nil {
+			p.publisher.Stop()
+		}
+		if p.managedClient && p.client != nil {
+			if cerr := p.client.Close(); cerr != nil {
+				err = fmt.Errorf("close pubsub client: %w", cerr)
+			}
+		}
+	})
+	return err
 }
 
 func validateConfig(cfg *Config) error {
@@ -295,15 +388,25 @@ func validateConfig(cfg *Config) error {
 		{"RequestTopicID", cfg.RequestTopicID},
 		{"RequestSubscriptionID", cfg.RequestSubscriptionID},
 		{"ResultTopicID", cfg.ResultTopicID},
-		{"ResultRoute", cfg.ResultRoute},
 	} {
 		if err := validateResourceID(field.name, field.value); err != nil {
 			return err
 		}
 	}
+	if cfg.ResultRoute == "" {
+		return errors.New("ResultRoute is required")
+	}
 	if cfg.ResultSubscriptionID == "" {
+		// The route is the subscription ID in this case, so it has to be a
+		// legal Pub/Sub resource name as well as a filter value.
+		if err := validateResourceID("ResultRoute", cfg.ResultRoute); err != nil {
+			return err
+		}
 		cfg.ResultSubscriptionID = cfg.ResultRoute
 	} else if err := validateResourceID("ResultSubscriptionID", cfg.ResultSubscriptionID); err != nil {
+		return err
+	}
+	if err := validateResultRouteFilter(cfg.ResultRoute); err != nil {
 		return err
 	}
 	if cfg.DeadLetterTopicID == "" {
@@ -354,13 +457,12 @@ func isResourceIDChar(c byte) bool {
 	}
 }
 
-func requestAttributes(metadata map[string]string, route string) map[string]string {
-	attrs := make(map[string]string, len(metadata)+1)
-	for k, v := range metadata {
-		attrs[k] = v
+func validateResultRouteFilter(route string) error {
+	filter := resultRouteFilter(route)
+	if len(filter) > maxSubscriptionFilterLen {
+		return fmt.Errorf("ResultRoute produces a subscription filter of %d bytes, over the %d byte Pub/Sub limit", len(filter), maxSubscriptionFilterLen)
 	}
-	attrs[api.ResultRouteAttribute] = route
-	return attrs
+	return nil
 }
 
 func topicResource(project, id string) string {

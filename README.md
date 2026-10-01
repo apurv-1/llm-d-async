@@ -805,7 +805,9 @@ The async processor expects request messages to have the following format:
 ```
 
 Producers handle wrapping Redis traffic into the internal wire format used for persistence and routing.
-The GCP Pub/Sub producer publishes a plain `RequestMessage` as message data and puts metadata on attributes.
+The GCP Pub/Sub producer publishes a plain `RequestMessage` as message data.
+Caller metadata stays in that body.
+Only `result_route` is set as a message attribute.
 
 ### Result Messages
 
@@ -1141,20 +1143,20 @@ Redis and GCP clients are separate modules so a GCP-only caller never imports `g
 | Module | Transport | Notes |
 | --- | --- | --- |
 | `github.com/llm-d/llm-d-async/producer` | Redis sorted set | Wraps requests in the [internal wire format](#internal-wire-format). Supports `CancelRequests` and durable result delivery. |
-| `github.com/llm-d/llm-d-async/producer-gcp` | GCP Pub/Sub | Publishes a plain `RequestMessage` as data with metadata on attributes. `CancelRequests` returns `api.ErrNotSupported`. Durable results are not in v1. |
+| `github.com/llm-d/llm-d-async/producer-gcp` | GCP Pub/Sub | Publishes a plain `RequestMessage`. Only `result_route` is a message attribute. `CancelRequests` returns `api.ErrNotSupported`. Durable results are not in v1. |
 
 `producer-gcp` stamps a `result_route` attribute on each request.
 The processor echoes that same attribute onto result publications.
 Each producer attaches a filtered result subscription so it only sees its own results.
 `RequestSubscriptionID` must match the processor's `subscriber_id`.
 
-By default `NewProducer` idempotently creates the request topic, the request subscription (exactly-once, exponential backoff, DLQ, never-expire), the result topic, this producer's filtered result subscription (7-day inactivity expiration), and a DLQ topic plus subscription.
+By default `NewProducer` idempotently creates the request topic, the request subscription (exactly-once, exponential backoff, DLQ, never-expire), the result topic, this producer's filtered result subscription (never-expire), and a DLQ topic plus subscription.
 `AlreadyExists` is success after checking that an existing subscription is attached to the expected topic (and, for the result subscription, that the filter matches).
 Use `WithoutCreateResources` for a publish-only identity.
 See [docs/proposals/gcp-pubsub-producer.md](docs/proposals/gcp-pubsub-producer.md).
 
 ```go
-p, err := producergcp.NewProducer(producergcp.Config{
+p, err := producergcp.NewProducer(ctx, producergcp.Config{
     ProjectID:             "my-project",
     RequestTopicID:        "requests",
     RequestSubscriptionID: "llm-d-async-requests",

@@ -30,6 +30,7 @@ type Producer interface {
 	// aborting requests that are already in flight to the inference backend
 	// or forcing already-dispatched requests to return a CANCELLED result.
 	// Cancellation is idempotent: unknown or already-completed request IDs are a no-op.
+	// An implementation that cannot cancel returns ErrNotSupported.
 	CancelRequests(ctx context.Context, requestIDs []string) error
 
 	// GetResult retrieves a result from the result queue.

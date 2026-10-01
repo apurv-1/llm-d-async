@@ -44,8 +44,8 @@ On Pub/Sub, every producer on a result topic would otherwise see every result.
    Their ownership fields cannot be populated cross-package.
    `producer` keeps `type Producer = api.Producer` so existing Redis callers compile.
 2. Add `github.com/llm-d/llm-d-async/producer-gcp` as a top-level module so `make set-version` and the submodule-tag workflow pick it up without Makefile changes.
-3. The producer publishes a plain `RequestMessage` as message data and puts caller metadata on attributes, plus `result_route` set to the configured route.
-   This is what `pkg/pubsub` already decodes.
+3. The producer publishes a plain `RequestMessage` as message data and sets `result_route` as the only message attribute.
+   Caller metadata stays in the body, which is what `pkg/pubsub` already decodes.
    There is no Redis-style `InternalRequest` envelope.
 4. `resultWorker` stamps that same `result_route` value as the only result attribute.
    Each producer creates a result subscription filtered on `attributes.result_route = "<route>"`.
@@ -86,8 +86,13 @@ On create, the request subscription is configured as the README describes:
 The emulator and `pstest` accept exactly-once but do not honor it.
 Tests assert the field is set, not the delivery effect.
 
-The result subscription gets a 7-day inactivity expiration so abandoned producer routes disappear.
+The result subscription does not expire, same as the request subscription.
+An idle producer would otherwise lose the subscription, and every result published after that would be dropped.
 The DLQ subscription never expires, so poison messages are not dropped by idle TTL.
+
+`NewProducer` takes a context.
+A deadline on that context is used as-is, so the caller can cancel provisioning or wait on a slow endpoint.
+With no deadline, provisioning stops after 30s.
 
 `AlreadyExists` handling:
 
@@ -112,8 +117,12 @@ A publish-only identity should use `WithoutCreateResources` and leave provisioni
 ### Result routing
 
 `api.ResultRouteAttribute` is `"result_route"`.
-The producer overwrites that attribute on the request even if the caller put it in metadata, so a client cannot send another producer's results to itself.
-The processor copies request attributes into `RequestMessage.Metadata`, and `NewHTTPResult` / `NewErrorResult` copy that onto `ResultMessage.Metadata`.
+The producer sets that attribute to the configured route.
+Caller metadata is not copied onto attributes, because attribute maps have hard size limits the JSON body does not.
+The processor copies request attributes into `RequestMessage.Metadata`, which overwrites a caller-supplied `result_route`, and `NewHTTPResult` / `NewErrorResult` copy that metadata onto `ResultMessage.Metadata`.
+A gate that builds its own drop result has to copy request metadata itself.
+The tier-priority admission gate does this for its 429 result.
+The Pub/Sub worker forwards that metadata and does not fill in a missing route.
 `resultWorker` reads only `Metadata["result_route"]` and publishes it as a Pub/Sub attribute.
 Requests with no route keep today's empty attributes, so existing e2e publishers and unfiltered result subscriptions keep working.
 
@@ -124,9 +133,13 @@ There is no cancel topic and no worker-side cancel check on the Pub/Sub path.
 
 ### Close and concurrency
 
-`GetResult` is serialized on one producer: Pub/Sub allows a single `Receive` per subscriber client.
+The first `GetResult` starts one `Receive` for the life of the producer and feeds a buffered channel.
+Later calls drain that channel.
+A caller whose context is already cancelled returns without taking a result.
 `SubmitRequest` may be called concurrently.
-`Close` stops the request publisher and, when the producer owns the client, closes it.
+`Close` stops the result receive and the request publisher and, when the producer owns the client, closes it.
+It leaves those fields set.
+A later call fails on the stopped publisher or the closed producer.
 
 ## Alternatives
 
