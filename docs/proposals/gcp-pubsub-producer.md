@@ -133,11 +133,14 @@ There is no cancel topic and no worker-side cancel check on the Pub/Sub path.
 
 ### Close and concurrency
 
-The first `GetResult` starts one `Receive` for the life of the producer and feeds a buffered channel.
+The first `GetResult` starts one `Receive` and feeds a buffered channel.
 Later calls drain that channel.
+A result stays unacknowledged until `GetResult` hands it to the caller, so a crash redelivers anything still buffered.
 A caller whose context is already cancelled returns without taking a result.
+If `Receive` returns an error, that call returns the error and the next `GetResult` starts a new stream.
 `SubmitRequest` may be called concurrently.
-`Close` stops the result receive and the request publisher and, when the producer owns the client, closes it.
+`Close` stops the result receive, nacks anything still buffered, and stops the request publisher.
+When the producer owns the client, `Close` closes it too.
 It leaves those fields set.
 A later call fails on the stopped publisher or the closed producer.
 

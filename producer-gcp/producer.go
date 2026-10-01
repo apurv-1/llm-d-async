@@ -100,13 +100,15 @@ type Producer struct {
 	deadLetterTopicID        string
 	deadLetterSubscriptionID string
 	createResources          bool
-	// results is filled by one Receive, started on the first GetResult.
+	// results is filled by one Receive. Messages stay unacked until GetResult
+	// takes them, so a crash redelivers anything still in this buffer.
 	results    chan receivedResult
-	recvOnce   sync.Once
 	recvCtx    context.Context
 	recvCancel context.CancelFunc
 	recvWG     sync.WaitGroup
 	recvMu     sync.Mutex
+	receiving  bool
+	streamDone chan struct{}
 	recvErr    error
 	closeOnce  sync.Once
 	closed     chan struct{}
@@ -115,6 +117,8 @@ type Producer struct {
 type receivedResult struct {
 	result *api.ResultMessage
 	err    error
+	ack    func()
+	nack   func()
 }
 
 // NewProducer creates a Pub/Sub producer. ctx bounds resource provisioning.
@@ -248,8 +252,10 @@ func (p *Producer) CancelRequests(_ context.Context, requestIDs []string) error 
 }
 
 // GetResult blocks until a result matching this producer's result_route is
-// delivered or ctx is cancelled. The first call starts one Receive for the
-// life of the producer. Later calls drain that stream.
+// delivered or ctx is cancelled. The first call starts one Receive. Later
+// calls drain that stream, and the message is acknowledged only after this
+// call takes it. If Receive returns an error, this call returns that error
+// and the next call starts a new Receive.
 func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
@@ -257,56 +263,91 @@ func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
 	if err := p.errIfClosed(); err != nil {
 		return nil, err
 	}
-	p.startReceive()
+	done := p.ensureReceive()
+
+	// A result already in the buffer is handed off before a dead stream.
+	select {
+	case item := <-p.results:
+		return takeResult(item)
+	default:
+	}
 
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
 	case <-p.closed:
 		return nil, errProducerClosed
-	case item, ok := <-p.results:
-		if !ok {
+	case <-done:
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
+		}
+		if err := p.errIfClosed(); err != nil {
+			return nil, err
+		}
+		select {
+		case item := <-p.results:
+			return takeResult(item)
+		default:
 			return nil, p.resultStreamErr()
 		}
-		if item.err != nil {
-			return nil, item.err
-		}
-		return item.result, nil
+	case item := <-p.results:
+		return takeResult(item)
 	}
 }
 
-func (p *Producer) startReceive() {
-	p.recvOnce.Do(func() {
-		p.recvMu.Lock()
-		defer p.recvMu.Unlock()
-		select {
-		case <-p.closed:
-			return
-		default:
-		}
-		p.recvWG.Add(1)
-		go p.receiveResults(p.recvCtx)
-	})
+func takeResult(item receivedResult) (*api.ResultMessage, error) {
+	if item.err != nil {
+		return nil, item.err
+	}
+	if item.ack != nil {
+		item.ack()
+	}
+	return item.result, nil
 }
 
-func (p *Producer) receiveResults(ctx context.Context) {
+// ensureReceive starts a Receive unless one is already running. A previous
+// stream that returned an error does not stick; the next call starts another.
+func (p *Producer) ensureReceive() <-chan struct{} {
+	p.recvMu.Lock()
+	defer p.recvMu.Unlock()
+	select {
+	case <-p.closed:
+		return p.closed
+	default:
+	}
+	if p.receiving {
+		return p.streamDone
+	}
+	p.receiving = true
+	p.recvErr = nil
+	done := make(chan struct{})
+	p.streamDone = done
+	p.recvWG.Add(1)
+	go p.receiveResults(p.recvCtx, done)
+	return done
+}
+
+func (p *Producer) receiveResults(ctx context.Context, done chan struct{}) {
 	defer p.recvWG.Done()
-	defer close(p.results)
+	defer close(done)
 
 	sub := p.client.Subscriber(p.resultSubscriptionID)
 	sub.ReceiveSettings.MaxOutstandingMessages = resultReceiveBuffer
 	sub.ReceiveSettings.NumGoroutines = 1
 	err := sub.Receive(ctx, p.enqueueResult)
+
+	p.recvMu.Lock()
+	p.receiving = false
 	if err != nil && ctx.Err() == nil {
-		p.recvMu.Lock()
 		p.recvErr = err
-		p.recvMu.Unlock()
 	}
+	p.recvMu.Unlock()
 }
 
 func (p *Producer) enqueueResult(ctx context.Context, msg *pubsub.Message) {
 	item := decodeResult(msg)
 	if item.err != nil {
+		// Poison is acked here so it is not redelivered.
 		msg.Ack()
 		select {
 		case p.results <- item:
@@ -315,8 +356,7 @@ func (p *Producer) enqueueResult(ctx context.Context, msg *pubsub.Message) {
 		return
 	}
 	select {
-	case p.results <- item:
-		msg.Ack()
+	case p.results <- receivedResult{result: item.result, ack: msg.Ack, nack: msg.Nack}:
 	case <-ctx.Done():
 		msg.Nack()
 	}
@@ -364,8 +404,16 @@ func (p *Producer) Close() error {
 		p.recvMu.Lock()
 		p.recvCancel()
 		close(p.closed)
+		done := p.streamDone
 		p.recvMu.Unlock()
+
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			p.nackBuffered(done)
+		}()
 		p.recvWG.Wait()
+		<-drained
 		if p.publisher != nil {
 			p.publisher.Stop()
 		}
@@ -376,6 +424,42 @@ func (p *Producer) Close() error {
 		}
 	})
 	return err
+}
+
+// nackBuffered releases results that were queued but never handed to GetResult.
+// When a stream is still running, it keeps nacking until that stream exits so
+// Receive can finish. Close then redelivers those results instead of dropping them.
+func (p *Producer) nackBuffered(done <-chan struct{}) {
+	if done == nil {
+		p.drainResults()
+		return
+	}
+	for {
+		select {
+		case item := <-p.results:
+			nackResult(item)
+		case <-done:
+			p.drainResults()
+			return
+		}
+	}
+}
+
+func (p *Producer) drainResults() {
+	for {
+		select {
+		case item := <-p.results:
+			nackResult(item)
+		default:
+			return
+		}
+	}
+}
+
+func nackResult(item receivedResult) {
+	if item.nack != nil {
+		item.nack()
+	}
 }
 
 func validateConfig(cfg *Config) error {
