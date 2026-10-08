@@ -302,7 +302,7 @@ Queue hot reload is enabled with `--transport redis-sortedset --transport-config
 | `batch_size` | redis-sortedset, gcp-pubsub | `10` | Messages per poll (sortedset) / inflight messages (Pub/Sub). |
 | `enable_tracing` | redis-* | `false` | Per-command Redis tracing spans via `redisotel`. High span volume — debugging only. |
 | `project_id` | gcp-pubsub | — | GCP project ID (required). |
-| `result_topic_id` | gcp-pubsub | — | Results topic ID (required). |
+| `result_topic_id` | gcp-pubsub | — | Default results topic ID. Required unless every topic entry sets its own `result_topic_id`. |
 | `queues` / `topics` | all | — | Array of queue/topic entries (at least one required). See below. |
 
 ### Queue and Topic Entry Fields
@@ -349,6 +349,14 @@ Each entry in `queues`/`topics` describes one request source and where its reque
 | `id` | no | `queue_name` | Unique queue identifier; becomes the `queue_id` metric label. |
 | `result_queue_name` | no | top-level `result_queue_name` | Per-queue result destination override. |
 | `result_ttl_seconds` | no | `0` (no expiry) | When > 0, sets an expiry on the result destination each time results are pushed. Used for per-request result keys (frontend enqueue mode) so unfetched results are cleaned up. |
+
+**Additional fields (`gcp-pubsub` only):**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `result_topic_id` | no | top-level `result_topic_id` | Per-topic result destination override. |
+
+**Result routing precedence (`redis-sortedset` and `gcp-pubsub`):** the per-queue/per-topic result destination wins; otherwise the per-message `ResultQueueName` (`result_queue_name` on `api.RedisRequest` / `api.PubSubRequest`; a result topic on `gcp-pubsub`) is used; otherwise results go to the top-level default.
 
 ### Worker Pools Configuration
 
@@ -560,16 +568,16 @@ The available gate types, at a glance:
 
   | # | Metric | Budget | Available when |
   |---|--------|--------|----------------|
-  | 0 | `inference_extension_flow_control_queue_size` | `D = 1 − (queue_size / max_SYS)` | EPP runs the flow control plugin |
-  | 1 | `inference_pool_per_pod_queue_size` | `D = 1 − (mean per-pod queue depth / max_concurrency)` | Always — part of EPP's base metric set |
+  | 0 | `llm_d_epp_flow_control_queue_size` | `D = 1 − (queue_size / max_SYS)` | EPP runs the flow control plugin |
+  | 1 | `llm_d_epp_per_endpoint_queue_size` | `D = 1 − (mean per-pod queue depth / max_concurrency)` | Always — part of EPP's base metric set |
   | 2 | `vllm:num_requests_running` | `D = 1 − (running_requests / max_SYS)` | vLLM metrics carry an `inference_pool` label |
 
   Sources 0 and 2 compute `max_SYS = ready_pods × max_concurrency` dynamically from the
-  `inference_pool_ready_pods` metric. Source 1 averages over pods, so the `ready_pods` factor
+  `llm_d_epp_ready_endpoints` metric. Source 1 averages over pods, so the `ready_pods` factor
   cancels and no join is needed. That also keeps it honest when the pool drains: EPP's metrics
   refresh [returns early when the pool has no pods](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/v1.2.1/pkg/epp/backend/metrics/logger.go#L89-L91),
-  so `inference_pool_ready_pods` and `inference_pool_average_queue_size` freeze at their last
-  values and a scaled-to-zero pool would read as idle capacity. `inference_pool_per_pod_queue_size`
+  so `llm_d_epp_ready_endpoints` and `llm_d_epp_average_queue_size` freeze at their last
+  values and a scaled-to-zero pool would read as idle capacity. `llm_d_epp_per_endpoint_queue_size`
   comes from a scrape-time collector that simply stops reporting, so the source yields no sample
   and the cascade moves on instead.
   The gate closes when `D ≤ baseline`; when open it returns `D − baseline`, so callers compute `N = max_SYS × (D − B)`.
@@ -580,7 +588,7 @@ The available gate types, at a glance:
   of them or fell back to `fallback`.
 
   - `pool` (**required**): The InferencePool name. This must match the `name` field in
-    `inference_pool_ready_pods{name="<pool>"}` and `inference_pool_per_pod_queue_size{name="<pool>"}`
+    `llm_d_epp_ready_endpoints{name="<pool>"}` and `llm_d_epp_per_endpoint_queue_size{name="<pool>"}`
     (EPP metrics) and, for the vLLM source, the `inference_pool` label on scraped vLLM metrics
     (added via relabeling from pod labels).
   - `namespace` (optional): Kubernetes namespace to scope metric queries. Required when multiple namespaces share the same pool name with a shared Prometheus instance.
@@ -616,7 +624,7 @@ The available gate types, at a glance:
 
     ```promql
     max_over_time(
-      (sum(vllm:num_requests_running{inference_pool="<pool>"}) / on() inference_pool_ready_pods{name="<pool>"})[1h:]
+      (sum(vllm:num_requests_running{inference_pool="<pool>"}) / on() llm_d_epp_ready_endpoints{name="<pool>"})[1h:]
     )
     ```
 
@@ -657,7 +665,7 @@ The available gate types, at a glance:
   - `baseline` (optional): Reserved headroom subtracted from budget. Default is `0.0`.
   - `fallback` (optional): Budget returned when scrape fails or metric is missing. Default is `0.0` (fail closed).
   - `pods_url` (optional): URL to scrape for dynamic pod count (e.g., `http://epp-svc:9090/metrics`). When set with `pods_metric`, `max_count = ready_pods * max_count_per_pod`.
-  - `pods_metric` (optional): Metric name for ready pods (e.g., `inference_pool_ready_pods`).
+  - `pods_metric` (optional): Metric name for ready pods (e.g., `llm_d_epp_ready_endpoints`).
   - `pods_labels` (optional): JSON label filters for the pods metric (e.g., `{"name":"my-pool"}`).
 
   **No Prometheus server required.** This gate scrapes endpoints directly, making it suitable for
@@ -874,6 +882,7 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 | Metric | Type | Description |
 |--------|------|-------------|
 | `llm_d_async_async_queue_depth` | Gauge | Requests received from the broker and buffered in-process awaiting an available worker |
+| `llm_d_async_async_gate_waiting_requests` | Gauge | Requests currently held by workers waiting for the pool dispatch gate to admit them (blocked in gate-wait). |
 | `llm_d_async_async_inflight_requests` | Gauge | Requests currently being processed by workers (dispatched to inference, awaiting a response) |
 | `llm_d_async_async_broker_backlog` | Gauge | Undelivered/pending messages held by the broker queue (polled every `metrics-backlog-poll-interval`; `redis-sortedset` and `gcp-pubsub` only). A zero is trustworthy only when the matching source-availability gauge is `1`. |
 | `llm_d_async_async_broker_backlog_source_available` | Gauge | `1` when the most recent broker-backlog read succeeded; `0` when the source was unavailable or errored. |
