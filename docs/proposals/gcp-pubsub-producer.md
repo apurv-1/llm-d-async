@@ -55,6 +55,42 @@ On Pub/Sub, every producer on a result topic would otherwise see every result.
 
 ## Design Details
 
+The diagram keeps the README's architecture terminology and highlights the new producer library and filtered result subscription in green.
+The result publication also gains the `result_route` attribute.
+
+```mermaid
+flowchart LR
+    subgraph Producers["Producers<br/>batch jobs, workflows"]
+        GCP["NEW: producer-gcp"]
+    end
+    GCP -- "enqueue requests<br/>result_route attribute" --> RQ
+
+    subgraph Broker["Message queue (bring your own)<br/>GCP Pub/Sub in this proposal"]
+        RQ[("Request queues")]
+        RESQ[("Result queue")]
+        Filter["NEW: Filtered result subscription<br/>attributes.result_route"]
+        RESQ --> Filter
+    end
+
+    subgraph AP["Async Processor"]
+        direction LR
+        Gates["Dispatch gates<br/>capacity & admission"] --> Merge["Merge policy<br/>per worker pool"] --> Workers["Worker pools"]
+    end
+
+    RQ --> Gates
+    Workers -- "HTTP" --> IGW["llm-d-router /<br/>inference gateway"] --> Pool["Inference pool<br/>(vLLM)"]
+    Workers -- "results<br/>NEW: result_route attribute on publication" --> RESQ
+    Filter --> GCP
+    Prom[("Prometheus")] -. "saturation & budget" .-> Gates
+
+    classDef added fill:#dcfce7,stroke:#15803d,color:#14532d,stroke-width:2px;
+    class GCP,Filter added;
+```
+
+For GCP Pub/Sub, **Request queues** means the request topic and processor subscription.
+**Result queue** means the result topic, with the producer consuming through its filtered subscription.
+The processor's existing `resultWorker` stamps the result attribute; this is not a new processing stage.
+
 ### Module layout
 
 | Module | Import | Client libraries |
