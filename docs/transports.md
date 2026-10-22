@@ -357,9 +357,13 @@ Each producer attaches a filtered result subscription so it only sees its own re
 
 By default `NewProducer` idempotently creates the request topic, the request subscription (exactly-once, exponential backoff, DLQ, never-expire), the result topic, this producer's filtered result subscription (never-expire), and a DLQ topic plus subscription.
 `AlreadyExists` is success after checking that an existing subscription is attached to the expected topic (and, for the result subscription, that the filter matches).
-It does not change the expiration policy.
+It does not change the expiration policy or the dead-letter attempt count.
 A subscription created with an inactivity TTL keeps that TTL.
-Delete it once so the next `NewProducer` creates it with no expiry.
+A subscription created with fewer delivery attempts keeps that limit.
+Delete it once so the next `NewProducer` creates it with no expiry and the configured attempt count.
+The request subscription dead-letters after `MaxDeliveryAttempts` deliveries.
+The default is 100, which is the Pub/Sub maximum, and the allowed range is 5-100.
+The processor Nacks on gate refusal and on retry, and each Nack counts, so the minimum of 5 drops a live request while a pool stays saturated and never publishes a result.
 Use `WithoutCreateResources` for a publish-only identity.
 See [the GCP Pub/Sub producer proposal](proposals/gcp-pubsub-producer.md).
 

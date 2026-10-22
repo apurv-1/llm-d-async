@@ -559,7 +559,7 @@ func TestProcessMessages_DropForwardsGateMetadata(t *testing.T) {
 		}
 	}()
 
-	_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil)
+	_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil, "")
 }
 
 func TestResultWorkerStampsResultRouteAttribute(t *testing.T) {
@@ -577,18 +577,23 @@ func TestResultWorkerStampsResultRouteAttribute(t *testing.T) {
 		t.Fatalf("create subscription: %v", err)
 	}
 
-	publisher := client.Publisher("results")
-	t.Cleanup(func() { publisher.Stop() })
+	sig := make(chan bool, 1)
+	resultChannels.Store("pub-1", sig)
+	t.Cleanup(func() { resultChannels.Delete("pub-1") })
 
 	resultCh := make(chan api.ResultMessage, 1)
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go resultWorker(wctx, publisher, resultCh)
+	go resultWorker(wctx, client, "results", resultCh)
 
 	resultCh <- api.ResultMessage{
-		ID:       "req-1",
-		Payload:  `{"ok":true}`,
-		Metadata: map[string]string{api.ResultRouteAttribute: "producer-a", "userid": "alice"},
+		ID:      "req-1",
+		Payload: `{"ok":true}`,
+		Routing: api.InternalRouting{TransportCorrelationID: "pub-1"},
+		Metadata: map[string]string{
+			api.ResultRouteAttribute: "producer-a",
+			"userid":                 "alice",
+		},
 	}
 
 	sub := client.Subscriber("results-sub")

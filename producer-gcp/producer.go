@@ -18,13 +18,20 @@ const (
 	newProducerTimeout        = 30 * time.Second
 	requestAckDeadlineSeconds = 600
 	resultAckDeadlineSeconds  = 60
-	maxDeliveryAttempts       = 5
-	minRetryBackoff           = 10 * time.Second
-	maxRetryBackoff           = 600 * time.Second
-	minPubSubResourceIDLen    = 3
-	maxPubSubResourceIDLen    = 255
-	maxSubscriptionFilterLen  = 256
-	resultReceiveBuffer       = 16
+	// Pub/Sub rejects a dead-letter policy outside this range.
+	minDeliveryAttempts int32 = 5
+	maxDeliveryAttempts int32 = 100
+	// defaultDeliveryAttempts is the Pub/Sub maximum. The processor Nacks a
+	// request when a gate refuses it and when a retry is requested, and each
+	// Nack counts. Five attempts, the minimum Pub/Sub allows, dead-letters a
+	// live request while a pool stays saturated, and no result is published.
+	defaultDeliveryAttempts  = maxDeliveryAttempts
+	minRetryBackoff          = 10 * time.Second
+	maxRetryBackoff          = 600 * time.Second
+	minPubSubResourceIDLen   = 3
+	maxPubSubResourceIDLen   = 255
+	maxSubscriptionFilterLen = 256
+	resultReceiveBuffer      = 16
 )
 
 var errProducerClosed = errors.New("producer is closed")
@@ -60,6 +67,14 @@ type Config struct {
 
 	// DeadLetterSubscriptionID defaults to DeadLetterTopicID + "-sub".
 	DeadLetterSubscriptionID string
+
+	// MaxDeliveryAttempts is how many times Pub/Sub delivers a request before
+	// dead-lettering it. Zero uses defaultDeliveryAttempts (100).
+	// Values outside 5-100 are rejected.
+	// The processor Nacks on gate refusal and on retry, and each Nack counts.
+	// An existing subscription keeps its dead-letter policy. Delete it once
+	// so the next NewProducer creates it with this value.
+	MaxDeliveryAttempts int32
 }
 
 // Option configures a Producer.
@@ -99,6 +114,7 @@ type Producer struct {
 	resultSubscriptionID     string
 	deadLetterTopicID        string
 	deadLetterSubscriptionID string
+	maxDeliveryAttempts      int32
 	createResources          bool
 	// results is filled by one Receive. Messages stay unacked until GetResult
 	// takes them, so a crash redelivers anything still in this buffer.
@@ -144,6 +160,7 @@ func NewProducer(ctx context.Context, cfg Config, opts ...Option) (*Producer, er
 		resultSubscriptionID:     cfg.ResultSubscriptionID,
 		deadLetterTopicID:        cfg.DeadLetterTopicID,
 		deadLetterSubscriptionID: cfg.DeadLetterSubscriptionID,
+		maxDeliveryAttempts:      cfg.MaxDeliveryAttempts,
 		createResources:          true,
 		results:                  make(chan receivedResult, resultReceiveBuffer),
 		recvCtx:                  recvCtx,
@@ -504,6 +521,11 @@ func validateConfig(cfg *Config) error {
 	}
 	if err := validateResourceID("DeadLetterSubscriptionID", cfg.DeadLetterSubscriptionID); err != nil {
 		return err
+	}
+	if cfg.MaxDeliveryAttempts == 0 {
+		cfg.MaxDeliveryAttempts = defaultDeliveryAttempts
+	} else if cfg.MaxDeliveryAttempts < minDeliveryAttempts || cfg.MaxDeliveryAttempts > maxDeliveryAttempts {
+		return fmt.Errorf("MaxDeliveryAttempts must be between %d and %d", minDeliveryAttempts, maxDeliveryAttempts)
 	}
 	return nil
 }

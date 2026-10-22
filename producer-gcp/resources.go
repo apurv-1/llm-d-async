@@ -73,7 +73,7 @@ func (p *Producer) ensureTopic(ctx context.Context, topicID string) error {
 func (p *Producer) ensureSubscription(ctx context.Context, spec subscriptionSpec) error {
 	name := subscriptionResource(p.projectID, spec.id)
 	wantTopic := topicResource(p.projectID, spec.topicID)
-	_, err := p.client.SubscriptionAdminClient.CreateSubscription(ctx, spec.toProto(p.projectID, name, wantTopic))
+	_, err := p.client.SubscriptionAdminClient.CreateSubscription(ctx, spec.toProto(p.projectID, name, wantTopic, p.maxDeliveryAttempts))
 	if err == nil {
 		return nil
 	}
@@ -96,7 +96,7 @@ func (p *Producer) ensureSubscription(ctx context.Context, spec subscriptionSpec
 	return nil
 }
 
-func (spec subscriptionSpec) toProto(project, name, topic string) *pubsubpb.Subscription {
+func (spec subscriptionSpec) toProto(project, name, topic string, deliveryAttempts int32) *pubsubpb.Subscription {
 	sub := &pubsubpb.Subscription{
 		Name:                      name,
 		Topic:                     topic,
@@ -113,7 +113,7 @@ func (spec subscriptionSpec) toProto(project, name, topic string) *pubsubpb.Subs
 	if spec.deadLetterTopicID != "" {
 		sub.DeadLetterPolicy = &pubsubpb.DeadLetterPolicy{
 			DeadLetterTopic:     topicResource(project, spec.deadLetterTopicID),
-			MaxDeliveryAttempts: maxDeliveryAttempts,
+			MaxDeliveryAttempts: deliveryAttempts,
 		}
 	}
 	if spec.neverExpire {

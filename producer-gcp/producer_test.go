@@ -117,7 +117,7 @@ func validRequest(id string) *api.RequestMessage {
 		ID:       id,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(time.Hour).Unix(),
-		Payload:  map[string]any{"prompt": "hi"},
+		Payload:  json.RawMessage(`{"prompt":"hi"}`),
 		Metadata: map[string]string{"userid": "alice"},
 	}
 }
@@ -138,6 +138,8 @@ func TestNewProducerValidatesConfig(t *testing.T) {
 		{name: "missing result route", mut: func(c *Config) { c.ResultRoute = "" }, wantSub: "ResultRoute"},
 		{name: "route starts with goog", mut: func(c *Config) { c.ResultRoute = "goog-route" }, wantSub: "goog"},
 		{name: "route too short", mut: func(c *Config) { c.ResultRoute = "ab" }, wantSub: "between"},
+		{name: "delivery attempts too low", mut: func(c *Config) { c.MaxDeliveryAttempts = 4 }, wantSub: "MaxDeliveryAttempts"},
+		{name: "delivery attempts too high", mut: func(c *Config) { c.MaxDeliveryAttempts = 101 }, wantSub: "MaxDeliveryAttempts"},
 	}
 
 	for _, tt := range tests {
@@ -178,6 +180,9 @@ func TestNewProducerCreatesResources(t *testing.T) {
 	if reqSub.GetDeadLetterPolicy() == nil || reqSub.GetDeadLetterPolicy().GetDeadLetterTopic() != topicResource(testProject, "requests-dlq") {
 		t.Errorf("request subscription DLQ = %+v", reqSub.GetDeadLetterPolicy())
 	}
+	if got := reqSub.GetDeadLetterPolicy().GetMaxDeliveryAttempts(); got != defaultDeliveryAttempts {
+		t.Errorf("max delivery attempts = %d, want %d", got, defaultDeliveryAttempts)
+	}
 	if reqSub.GetAckDeadlineSeconds() != requestAckDeadlineSeconds {
 		t.Errorf("request ack deadline = %d, want %d", reqSub.GetAckDeadlineSeconds(), requestAckDeadlineSeconds)
 	}
@@ -207,6 +212,24 @@ func TestNewProducerCreatesResources(t *testing.T) {
 
 	// Idempotent: a second New against the same resources succeeds.
 	_ = newTestProducer(t, client, testConfig())
+}
+
+func TestNewProducerSetsMaxDeliveryAttempts(t *testing.T) {
+	client := newFakeClient(t)
+	cfg := testConfig()
+	cfg.MaxDeliveryAttempts = 20
+	_ = newTestProducer(t, client, cfg)
+
+	ctx := context.Background()
+	reqSub, err := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
+		Subscription: subscriptionResource(testProject, "request-sub"),
+	})
+	if err != nil {
+		t.Fatalf("get request subscription: %v", err)
+	}
+	if got := reqSub.GetDeadLetterPolicy().GetMaxDeliveryAttempts(); got != 20 {
+		t.Errorf("max delivery attempts = %d, want 20", got)
+	}
 }
 
 func TestNewProducerRejectsTopicMismatch(t *testing.T) {

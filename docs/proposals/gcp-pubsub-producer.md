@@ -104,20 +104,25 @@ The processor's existing `resultWorker` stamps the result attribute; this is not
 Required: `ProjectID`, `RequestTopicID`, `RequestSubscriptionID`, `ResultTopicID`, `ResultRoute`.
 `RequestSubscriptionID` must match the processor's `subscriber_id`.
 `ResultRoute` is the filter value and, by default, the result subscription ID.
-Optional: `ResultSubscriptionID`, `DeadLetterTopicID` (default `<RequestTopicID>-dlq`), `DeadLetterSubscriptionID` (default `<DeadLetterTopicID>-sub`).
+Optional: `ResultSubscriptionID`, `DeadLetterTopicID` (default `<RequestTopicID>-dlq`), `DeadLetterSubscriptionID` (default `<DeadLetterTopicID>-sub`), `MaxDeliveryAttempts` (default 100, allowed range 5-100).
 
 Two producers that share `ResultRoute` and `ResultSubscriptionID` compete on one subscription (Redis-like).
 Two producers that share `ResultRoute` but use different subscription IDs each receive a copy.
 
 ### Provisioning
 
-On create, the request subscription is configured as the README describes:
+On create, the request subscription is configured as the [transports reference](../transports.md#producer-libraries) describes:
 
 - exactly-once delivery
-- exponential backoff retry (10s–600s)
-- dead-letter topic with `max_delivery_attempts=5`
+- exponential backoff retry (10s-600s)
+- dead-letter topic with `max_delivery_attempts` defaulting to 100
 - ack deadline of 600s, covering one in-flight inference attempt
 - expiration policy with no TTL, so the processor subscription never expires
+
+`MaxDeliveryAttempts` must be between 5 and 100.
+The processor Nacks a request when a gate refuses it and when a retry is requested, and each Nack counts as a delivery attempt.
+The Pub/Sub minimum of 5 dead-letters a live request while a pool stays saturated, and no result is ever published.
+100 is the maximum Pub/Sub allows, so that is the default.
 
 The emulator and `pstest` accept exactly-once but do not honor it.
 Tests assert the field is set, not the delivery effect.
@@ -135,8 +140,11 @@ With no deadline, provisioning stops after 30s.
 - Topic: treat as success.
 - Subscription: `GetSubscription` and fail if `topic` does not match.
 - Result subscription: also fail if `filter` does not match.
-- Other settings (exactly-once, retry, DLQ, ack deadline) are not mutated on an existing subscription.
+- Other settings (exactly-once, retry, DLQ, including max delivery attempts, ack deadline, expiration) are not mutated on an existing subscription.
   Operators who created the processor subscription by hand keep their values.
+  A subscription created with an inactivity TTL keeps that TTL.
+  A subscription created with fewer delivery attempts keeps that limit.
+  Delete it once so the next `NewProducer` creates it with no expiry and the configured attempt count.
 
 ### DLQ IAM
 
