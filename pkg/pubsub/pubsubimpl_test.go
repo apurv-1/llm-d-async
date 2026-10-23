@@ -507,9 +507,9 @@ func (m *mockDropGate) Apply(ctx context.Context, msg *api.InternalRequest, rele
 	return pipeline.Drop(m.result), nil
 }
 
-// TestProcessMessages_DropForwardsGateMetadata checks that a drop result is
-// queued with the metadata the gate set. The transport does not copy
-// result_route off the request; gates that need it put it on the result.
+// TestProcessMessages_DropForwardsGateMetadata checks that a drop result keeps
+// the gate's metadata and gains result_route from the request when the gate
+// left it out. Gate keys win over the request.
 func TestProcessMessages_DropForwardsGateMetadata(t *testing.T) {
 	flow := &PubSubMQFlow{resultChannel: make(chan api.ResultMessage, 1)}
 	ch := make(chan *api.InternalRequest, 1)
@@ -520,7 +520,10 @@ func TestProcessMessages_DropForwardsGateMetadata(t *testing.T) {
 		Metadata: map[string]string{"userid": "alice"},
 	}}
 
-	msgData, _ := json.Marshal(api.RequestMessage{ID: "test-msg"})
+	msgData, _ := json.Marshal(api.RequestMessage{
+		ID:       "test-msg",
+		Metadata: map[string]string{"userid": "carol"},
+	})
 	receive := func(ctx context.Context, f func(context.Context, *pubsub.Message)) error {
 		f(ctx, &pubsub.Message{
 			ID:         "msg-drop-1",
@@ -554,8 +557,11 @@ func TestProcessMessages_DropForwardsGateMetadata(t *testing.T) {
 		if got.Metadata["userid"] != "alice" {
 			t.Fatalf("drop result metadata = %v, want userid=alice", got.Metadata)
 		}
-		if _, ok := got.Metadata[api.ResultRouteAttribute]; ok {
-			t.Fatalf("transport added result_route to drop metadata: %v", got.Metadata)
+		if got.Metadata[api.ResultRouteAttribute] != "producer-a" {
+			t.Fatalf("drop result metadata = %v, want result_route filled from the request", got.Metadata)
+		}
+		if _, ok := gate.result.Metadata[api.ResultRouteAttribute]; ok {
+			t.Fatalf("backfill mutated the gate result: %v", gate.result.Metadata)
 		}
 	}()
 

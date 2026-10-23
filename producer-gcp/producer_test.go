@@ -93,6 +93,28 @@ func cloneAttrs(in map[string]string) map[string]string {
 	return out
 }
 
+func publishDeadLetter(t *testing.T, client *pubsub.Client, topicID, id, route string) {
+	t.Helper()
+	data, err := json.Marshal(api.RequestMessage{
+		ID:      id,
+		Payload: json.RawMessage(`{"prompt":"hi"}`),
+	})
+	if err != nil {
+		t.Fatalf("marshal dead letter: %v", err)
+	}
+	attrs := map[string]string{}
+	if route != "" {
+		attrs[api.ResultRouteAttribute] = route
+	}
+	publisher := client.Publisher(topicID)
+	t.Cleanup(func() { publisher.Stop() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := publisher.Publish(ctx, &pubsub.Message{Data: data, Attributes: attrs}).Get(ctx); err != nil {
+		t.Fatalf("publish dead letter: %v", err)
+	}
+}
+
 func publishResult(t *testing.T, client *pubsub.Client, topicID, id, route string) {
 	t.Helper()
 	data, err := json.Marshal(api.ResultMessage{ID: id, Payload: `{"ok":true}`})
@@ -138,8 +160,27 @@ func TestNewProducerValidatesConfig(t *testing.T) {
 		{name: "missing result route", mut: func(c *Config) { c.ResultRoute = "" }, wantSub: "ResultRoute"},
 		{name: "route starts with goog", mut: func(c *Config) { c.ResultRoute = "goog-route" }, wantSub: "goog"},
 		{name: "route too short", mut: func(c *Config) { c.ResultRoute = "ab" }, wantSub: "between"},
+		{name: "route is not a resource id", mut: func(c *Config) {
+			c.ResultRoute = "tenant:42"
+			c.ResultSubscriptionID = "tenant-42-results"
+		}, wantSub: "ResultRoute"},
+		{name: "route filter too long", mut: func(c *Config) {
+			c.ResultRoute = strings.Repeat("a", 229)
+			c.ResultSubscriptionID = "tenant-results"
+		}, wantSub: "256"},
 		{name: "delivery attempts too low", mut: func(c *Config) { c.MaxDeliveryAttempts = 4 }, wantSub: "MaxDeliveryAttempts"},
 		{name: "delivery attempts too high", mut: func(c *Config) { c.MaxDeliveryAttempts = 101 }, wantSub: "MaxDeliveryAttempts"},
+		{name: "client project mismatch", mut: func(c *Config) { c.ProjectID = "other-project" }, wantSub: "does not match"},
+		{name: "request topic is the dlq", mut: func(c *Config) { c.DeadLetterTopicID = c.RequestTopicID }, wantSub: "must differ"},
+		{name: "request topic is the result topic", mut: func(c *Config) { c.ResultTopicID = c.RequestTopicID }, wantSub: "must differ"},
+		{name: "dlq topic is the result topic", mut: func(c *Config) { c.DeadLetterTopicID = c.ResultTopicID }, wantSub: "must differ"},
+		{name: "request and result subs collide", mut: func(c *Config) { c.ResultSubscriptionID = c.RequestSubscriptionID }, wantSub: "must differ"},
+		{name: "dlq sub is the request sub", mut: func(c *Config) { c.DeadLetterSubscriptionID = c.RequestSubscriptionID }, wantSub: "must differ"},
+		{name: "default dlq sub too long", mut: func(c *Config) {
+			c.RequestTopicID = strings.Repeat("a", 200)
+			c.ResultRoute = strings.Repeat("b", 200)
+			c.ResultSubscriptionID = "results-sub"
+		}, wantSub: "DeadLetterSubscriptionID"},
 	}
 
 	for _, tt := range tests {
@@ -204,10 +245,14 @@ func TestNewProducerCreatesResources(t *testing.T) {
 		t.Errorf("result subscription should never expire, got %+v", resSub.GetExpirationPolicy())
 	}
 
-	if _, err := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
-		Subscription: subscriptionResource(testProject, "requests-dlq-sub"),
-	}); err != nil {
+	dlqSub, err := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
+		Subscription: subscriptionResource(testProject, "requests-dlq-producer-a"),
+	})
+	if err != nil {
 		t.Fatalf("get DLQ subscription: %v", err)
+	}
+	if dlqSub.GetFilter() != wantFilter {
+		t.Errorf("dlq filter = %q, want %q", dlqSub.GetFilter(), wantFilter)
 	}
 
 	// Idempotent: a second New against the same resources succeeds.
@@ -486,7 +531,7 @@ func TestGetResultDrainsSeveralResults(t *testing.T) {
 func TestResultRouteWithExplicitSubscriptionID(t *testing.T) {
 	client := newFakeClient(t)
 	cfg := testConfig()
-	cfg.ResultRoute = "tenant:42"
+	cfg.ResultRoute = "tenant-42"
 	cfg.ResultSubscriptionID = "tenant-42-results"
 	p := newTestProducer(t, client, cfg)
 
@@ -499,17 +544,6 @@ func TestResultRouteWithExplicitSubscriptionID(t *testing.T) {
 	}
 	if resSub.GetFilter() != resultRouteFilter(p.resultRoute) {
 		t.Errorf("filter = %q", resSub.GetFilter())
-	}
-}
-
-func TestResultRouteFilterTooLong(t *testing.T) {
-	client := newFakeClient(t)
-	cfg := testConfig()
-	cfg.ResultRoute = strings.Repeat("a", 300)
-	cfg.ResultSubscriptionID = "tenant-results"
-	_, err := NewProducer(context.Background(), cfg, WithPubSubClient(client))
-	if err == nil || !strings.Contains(err.Error(), "256") {
-		t.Fatalf("error = %v, want filter length limit", err)
 	}
 }
 
@@ -563,8 +597,19 @@ func TestCloseThenUse(t *testing.T) {
 }
 
 func TestCloseDuringCallsDoesNotPanic(t *testing.T) {
-	client := newFakeClient(t)
+	client, srv := newFake(t)
 	p := newTestProducer(t, client, testConfig())
+	publishResult(t, client, "results", "held", "producer-a")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := p.GetResult(ctx)
+	if err != nil {
+		t.Fatalf("GetResult: %v", err)
+	}
+	if got.ID != "held" {
+		t.Fatalf("result id = %q, want held", got.ID)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -583,6 +628,31 @@ func TestCloseDuringCallsDoesNotPanic(t *testing.T) {
 		t.Errorf("Close: %v", err)
 	}
 	wg.Wait()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		acks, deliveries := messageStats(srv, "held")
+		if acks == 1 && deliveries == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("acks=%d deliveries=%d, want exactly one delivery and one ack", acks, deliveries)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func messageStats(srv *pstest.Server, id string) (acks, deliveries int) {
+	for _, msg := range srv.Messages() {
+		var body struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(msg.Data, &body); err != nil || body.ID != id {
+			continue
+		}
+		return msg.Acks, msg.Deliveries
+	}
+	return 0, 0
 }
 
 func resultRouteStats(srv *pstest.Server, route string) (acked, delivered int) {
@@ -637,6 +707,76 @@ func TestGetResultAcksOnlyTheHandoff(t *testing.T) {
 	}
 	if other.ID == got.ID {
 		t.Fatalf("redelivered %q, which was already handed off", other.ID)
+	}
+}
+
+func TestGetResultSurfacesDeadLetter(t *testing.T) {
+	client, srv := newFake(t)
+	a := newTestProducer(t, client, testConfig())
+	cfgB := testConfig()
+	cfgB.ResultRoute = "producer-b"
+	_ = newTestProducer(t, client, cfgB)
+
+	ctx := context.Background()
+	for _, route := range []string{"producer-a", "producer-b"} {
+		sub, err := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
+			Subscription: subscriptionResource(testProject, "requests-dlq-"+route),
+		})
+		if err != nil {
+			t.Fatalf("get DLQ subscription %s: %v", route, err)
+		}
+		if sub.GetFilter() != resultRouteFilter(route) {
+			t.Errorf("dlq filter for %s = %q", route, sub.GetFilter())
+		}
+	}
+
+	publishDeadLetter(t, client, a.deadLetterTopicID, "poisoned", a.resultRoute)
+	getCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := a.GetResult(getCtx)
+	if err != nil {
+		t.Fatalf("GetResult: %v", err)
+	}
+	if got.ID != "poisoned" || got.ErrorCode != api.ErrCodeDeadLettered {
+		t.Fatalf("result = %+v, want dead-lettered poisoned", got)
+	}
+	if !strings.Contains(got.Payload, deadLetterMessage) {
+		t.Fatalf("payload = %q, want %q", got.Payload, deadLetterMessage)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		acked, _ := resultRouteStats(srv, "producer-a")
+		if acked == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dead-letter acks = %d, want 1", acked)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestReceiveErrorSurvivesRestart(t *testing.T) {
+	client := newFakeClient(t)
+	p := newTestProducer(t, client, testConfig(), WithoutCreateResources())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	for i := range errs {
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = p.GetResult(ctx)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err == nil || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "without a message") {
+			t.Fatalf("GetResult %d = %v, want the receive error", i, err)
+		}
 	}
 }
 

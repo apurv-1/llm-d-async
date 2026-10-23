@@ -31,6 +31,7 @@ func (p *Producer) ensureResources(ctx context.Context) error {
 	dlqSub := subscriptionSpec{
 		id:                 p.deadLetterSubscriptionID,
 		topicID:            p.deadLetterTopicID,
+		filter:             resultRouteFilter(p.resultRoute),
 		ackDeadlineSeconds: resultAckDeadlineSeconds,
 		neverExpire:        true,
 	}

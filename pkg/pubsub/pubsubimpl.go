@@ -502,6 +502,24 @@ func resultWorker(ctx context.Context, client *pubsub.Client, defaultTopicID str
 	}
 }
 
+// backfillResultMetadata copies request metadata, then result metadata.
+// A key the gate omitted, including result_route, is filled from the request.
+// A key the gate set wins. The returned map is new, so later reads do not
+// alias the request or the gate's map.
+func backfillResultMetadata(request, result map[string]string) map[string]string {
+	if len(request) == 0 && len(result) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(request)+len(result))
+	for k, v := range request {
+		merged[k] = v
+	}
+	for k, v := range result {
+		merged[k] = v
+	}
+	return merged
+}
+
 // resultPublishAttributes returns the Pub/Sub attributes stamped on a result
 // publication. Only result_route is copied; caller metadata is not echoed.
 func resultPublishAttributes(msg api.ResultMessage) map[string]string {
@@ -715,6 +733,7 @@ func (r *PubSubMQFlow) processMessages(ctx context.Context, receive receiveFunc,
 			if verdict.Result != nil {
 				resultMsg = *verdict.Result
 				resultMsg.Routing = ir.InternalRouting
+				resultMsg.Metadata = backfillResultMetadata(body.Metadata, verdict.Result.Metadata)
 			} else {
 				resultMsg = api.NewGateDroppedResult(&body, ir.InternalRouting)
 			}

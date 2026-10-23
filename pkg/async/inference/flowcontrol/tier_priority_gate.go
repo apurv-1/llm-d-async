@@ -53,25 +53,15 @@ func (g *TierPriorityAdmissionGate) Apply(ctx context.Context, msg *api.Internal
 
 	if tier == string(api.TierInteractive) && classification == api.ClassificationOverflow {
 		result := &api.ResultMessage{
-			ID:       msg.PublicRequest.ReqID(),
-			Payload:  `{"error": "Too Many Requests", "code": 429}`,
-			Routing:  msg.InternalRouting,
-			Metadata: copyMetadata(msg.PublicRequest.ReqMetadata()),
+			ID:      msg.PublicRequest.ReqID(),
+			Payload: `{"error": "Too Many Requests", "code": 429}`,
+			Routing: msg.InternalRouting,
+			// Alias the request map, same as api.NewErrorResult.
+			// The Pub/Sub drop path copies before it fills result_route.
+			Metadata: msg.PublicRequest.ReqMetadata(),
 		}
 		return pipeline.Drop(result), nil
 	}
 
 	return pipeline.Refuse(), nil
-}
-
-// copyMetadata gives the drop result its own metadata map.
-func copyMetadata(src map[string]string) map[string]string {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
 }

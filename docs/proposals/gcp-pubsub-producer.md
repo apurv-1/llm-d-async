@@ -104,7 +104,12 @@ The processor's existing `resultWorker` stamps the result attribute; this is not
 Required: `ProjectID`, `RequestTopicID`, `RequestSubscriptionID`, `ResultTopicID`, `ResultRoute`.
 `RequestSubscriptionID` must match the processor's `subscriber_id`.
 `ResultRoute` is the filter value and, by default, the result subscription ID.
-Optional: `ResultSubscriptionID`, `DeadLetterTopicID` (default `<RequestTopicID>-dlq`), `DeadLetterSubscriptionID` (default `<DeadLetterTopicID>-sub`), `MaxDeliveryAttempts` (default 100, allowed range 5-100).
+It must be a Pub/Sub resource ID even when `ResultSubscriptionID` is set, because the filter quotes the route and `%q` escapes are not Pub/Sub filter syntax.
+Optional: `ResultSubscriptionID`, `DeadLetterTopicID` (default `<RequestTopicID>-dlq`), `DeadLetterSubscriptionID` (default `<DeadLetterTopicID>-<ResultRoute>`), `MaxDeliveryAttempts` (default 100, allowed range 5-100).
+`RequestTopicID`, `ResultTopicID`, and `DeadLetterTopicID` must differ.
+The three subscription IDs must differ too.
+A topic ID may match a subscription ID. Those are different namespaces.
+An injected client must already be for `ProjectID`. The producer does not copy one value onto the other.
 
 Two producers that share `ResultRoute` and `ResultSubscriptionID` compete on one subscription (Redis-like).
 Two producers that share `ResultRoute` but use different subscription IDs each receive a copy.
@@ -130,6 +135,11 @@ Tests assert the field is set, not the delivery effect.
 The result subscription does not expire, same as the request subscription.
 An idle producer would otherwise lose the subscription, and every result published after that would be dropped.
 The DLQ subscription never expires, so poison messages are not dropped by idle TTL.
+It is filtered on `result_route` and defaults to `<DeadLetterTopicID>-<ResultRoute>`.
+`GetResult` reads it and returns a dead-lettered request as an error result with `error_code` `DEAD_LETTERED`, then acknowledges it.
+Producers that share a route compete for those messages.
+A result or dead letter that `GetResult` has not taken within 60 minutes is redelivered.
+That is the Pub/Sub lease extension limit, and the producer sets `MaxExtension` to it.
 
 `NewProducer` takes a context.
 A deadline on that context is used as-is, so the caller can cancel provisioning or wait on a slow endpoint.
@@ -163,10 +173,9 @@ A publish-only identity should use `WithoutCreateResources` and leave provisioni
 `api.ResultRouteAttribute` is `"result_route"`.
 The producer sets that attribute to the configured route.
 Caller metadata is not copied onto attributes, because attribute maps have hard size limits the JSON body does not.
-The processor copies request attributes into `RequestMessage.Metadata`, which overwrites a caller-supplied `result_route`, and `NewHTTPResult` / `NewErrorResult` copy that metadata onto `ResultMessage.Metadata`.
-A gate that builds its own drop result has to copy request metadata itself.
-The tier-priority admission gate does this for its 429 result.
-The Pub/Sub worker forwards that metadata and does not fill in a missing route.
+The processor copies request attributes into `RequestMessage.Metadata`, which overwrites a caller-supplied `result_route`, and `NewHTTPResult` / `NewErrorResult` alias that metadata onto `ResultMessage.Metadata`.
+On a gate drop, the Pub/Sub worker copies request metadata onto the result and then applies the gate's keys, so a missing `result_route` is filled in and a key the gate set wins.
+The tier-priority admission gate aliases the request metadata, the same way those constructors do.
 `resultWorker` reads only `Metadata["result_route"]` and publishes it as a Pub/Sub attribute.
 Requests with no route keep today's empty attributes, so existing e2e publishers and unfiltered result subscriptions keep working.
 
@@ -177,11 +186,13 @@ There is no cancel topic and no worker-side cancel check on the Pub/Sub path.
 
 ### Close and concurrency
 
-The first `GetResult` starts one `Receive` and feeds a buffered channel.
+The first `GetResult` starts one receive on the result subscription and one on the dead-letter subscription, and feeds a buffered channel.
 Later calls drain that channel.
 A result stays unacknowledged until `GetResult` hands it to the caller, so a crash redelivers anything still buffered.
+The ack or nack is issued before that receive callback returns, so it is not dropped when the stream stops.
 A caller whose context is already cancelled returns without taking a result.
-If `Receive` returns an error, that call returns the error and the next `GetResult` starts a new stream.
+If a receive returns an error, that call returns the error.
+The error stays on that stream, and the next `GetResult` starts a new one.
 `SubmitRequest` may be called concurrently.
 `Close` stops the result receive, nacks anything still buffered, and stops the request publisher.
 When the producer owns the client, `Close` closes it too.

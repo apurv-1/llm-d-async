@@ -200,7 +200,7 @@ Results are written to the result queue/topic with the following structure:
 | `id` | string | The originating request's `id` |
 | `status_code` | int | HTTP status code of the inference response. Present (> 0) whenever an HTTP response was received — including error statuses. |
 | `payload` | string | The response body. On non-HTTP failures it carries a JSON `{"error": "<message>"}` object. |
-| `error_code` | string | Set for non-HTTP failures (when `status_code` is absent): `DEADLINE_EXCEEDED`, `CANCELLED`, `GATE_DROPPED`, `GATE_ERROR`, `INFERENCE_ERROR`, `INVALID_REQUEST`, `PAYLOAD_UNAVAILABLE` |
+| `error_code` | string | Set for non-HTTP failures (when `status_code` is absent): `DEADLINE_EXCEEDED`, `CANCELLED`, `GATE_DROPPED`, `GATE_ERROR`, `INFERENCE_ERROR`, `INVALID_REQUEST`, `PAYLOAD_UNAVAILABLE`, `DEAD_LETTERED` |
 | `error_message` | string | Human-readable description accompanying `error_code` |
 
 ### Internal Wire Format
@@ -354,16 +354,27 @@ Redis, SQL, and GCP clients are separate modules so a GCP-only caller never impo
 The processor echoes that same attribute onto result publications.
 Each producer attaches a filtered result subscription so it only sees its own results.
 `RequestSubscriptionID` must match the processor's `subscriber_id`.
+`ResultRoute` has to be a Pub/Sub resource ID, even when `ResultSubscriptionID` is set.
+The filter is `attributes.result_route = "<route>"`, and a character outside that charset is not valid filter syntax.
+`RequestTopicID`, `ResultTopicID`, and `DeadLetterTopicID` must be three different topics.
+The three subscription IDs must differ as well.
+An injected Pub/Sub client must already be for `ProjectID`.
 
-By default `NewProducer` idempotently creates the request topic, the request subscription (exactly-once, exponential backoff, DLQ, never-expire), the result topic, this producer's filtered result subscription (never-expire), and a DLQ topic plus subscription.
-`AlreadyExists` is success after checking that an existing subscription is attached to the expected topic (and, for the result subscription, that the filter matches).
+By default `NewProducer` idempotently creates the request topic, the request subscription (exactly-once, exponential backoff, DLQ, never-expire), the result topic, this producer's filtered result subscription (never-expire), and a DLQ topic plus a filtered DLQ subscription.
+The DLQ subscription defaults to `<DeadLetterTopicID>-<ResultRoute>`, so producers on one dead-letter topic do not share a subscription.
+`GetResult` reads that subscription and returns a dead-lettered request as an error result with `error_code` `DEAD_LETTERED`.
+`AlreadyExists` is success after checking that an existing subscription is attached to the expected topic and, when a filter is required, that the filter matches.
 It does not change the expiration policy or the dead-letter attempt count.
 A subscription created with an inactivity TTL keeps that TTL.
 A subscription created with fewer delivery attempts keeps that limit.
-Delete it once so the next `NewProducer` creates it with no expiry and the configured attempt count.
+An existing result or DLQ subscription whose filter does not match is an error.
+Delete it once so the next `NewProducer` creates it with the route filter, no expiry, and the configured attempt count.
 The request subscription dead-letters after `MaxDeliveryAttempts` deliveries.
 The default is 100, which is the Pub/Sub maximum, and the allowed range is 5-100.
 The processor Nacks on gate refusal and on retry, and each Nack counts, so the minimum of 5 drops a live request while a pool stays saturated and never publishes a result.
+A result or dead letter that `GetResult` has not taken within 60 minutes is redelivered.
+That is the Pub/Sub lease extension, and the producer sets it explicitly.
+On a gate drop, the worker copies request metadata onto the result and then applies the gate's keys, so `result_route` is still published when the gate built its own result.
 Use `WithoutCreateResources` for a publish-only identity.
 See [the GCP Pub/Sub producer proposal](proposals/gcp-pubsub-producer.md).
 

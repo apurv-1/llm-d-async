@@ -32,6 +32,11 @@ const (
 	maxPubSubResourceIDLen   = 255
 	maxSubscriptionFilterLen = 256
 	resultReceiveBuffer      = 16
+	// resultMaxExtension matches the Pub/Sub client default. GetResult holds a
+	// message until the caller takes it, but the lease is not extended past
+	// this, and a slower caller is redelivered a duplicate.
+	resultMaxExtension = 60 * time.Minute
+	deadLetterMessage  = "request was dead-lettered"
 )
 
 var errProducerClosed = errors.New("producer is closed")
@@ -53,19 +58,24 @@ type Config struct {
 	ResultTopicID string
 
 	// ResultRoute is the result_route attribute value used to filter this
-	// producer's result subscription. Required.
+	// producer's result subscription and its dead-letter subscription.
+	// Required. It must be a Pub/Sub resource ID even when ResultSubscriptionID
+	// is set, because the filter quotes it and escaped characters are not
+	// valid Pub/Sub filter syntax.
 	ResultRoute string
 
-	// ResultSubscriptionID is the result subscription ID. Defaults to ResultRoute,
-	// which must then be a valid Pub/Sub resource ID.
+	// ResultSubscriptionID is the result subscription ID. Defaults to ResultRoute.
 	// Producers that share ResultRoute and ResultSubscriptionID compete on one
 	// subscription. Distinct subscription IDs with the same route each get a copy.
 	ResultSubscriptionID string
 
 	// DeadLetterTopicID defaults to RequestTopicID + "-dlq".
+	// It must differ from RequestTopicID and ResultTopicID.
 	DeadLetterTopicID string
 
-	// DeadLetterSubscriptionID defaults to DeadLetterTopicID + "-sub".
+	// DeadLetterSubscriptionID defaults to DeadLetterTopicID + "-" + ResultRoute,
+	// so two producers on the same dead-letter topic do not share one subscription.
+	// The subscription is filtered on ResultRoute. GetResult reads it.
 	DeadLetterSubscriptionID string
 
 	// MaxDeliveryAttempts is how many times Pub/Sub delivers a request before
@@ -82,6 +92,7 @@ type Option func(*Producer) error
 
 // WithPubSubClient injects a pre-configured client (tests, tracing hooks, emulator).
 // The caller retains ownership; Close() will not close it.
+// client.Project() must equal Config.ProjectID. NewProducer does not adopt either value from the other.
 func WithPubSubClient(client *pubsub.Client) Option {
 	return func(p *Producer) error {
 		if client == nil {
@@ -124,10 +135,17 @@ type Producer struct {
 	recvWG     sync.WaitGroup
 	recvMu     sync.Mutex
 	receiving  bool
-	streamDone chan struct{}
-	recvErr    error
-	closeOnce  sync.Once
-	closed     chan struct{}
+	// stream is the receive currently in flight. Its error is set before done
+	// is closed and is never cleared, so the next stream cannot drop it.
+	stream    *resultStream
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+// resultStream is one pair of result and dead-letter receives.
+type resultStream struct {
+	done chan struct{}
+	err  error
 }
 
 type receivedResult struct {
@@ -141,7 +159,8 @@ type receivedResult struct {
 // When ctx has no deadline, provisioning stops after 30s.
 // By default it idempotently creates the request topic, request subscription,
 // result topic, this producer's filtered result subscription, and a DLQ topic
-// plus subscription. None of those subscriptions expire.
+// plus a filtered DLQ subscription. None of those subscriptions expire.
+// GetResult reads both the result subscription and the DLQ subscription.
 func NewProducer(ctx context.Context, cfg Config, opts ...Option) (*Producer, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
@@ -191,6 +210,9 @@ func NewProducer(ctx context.Context, cfg Config, opts ...Option) (*Producer, er
 		}
 		p.client = client
 		p.managedClient = true
+	}
+	if p.client.Project() != cfg.ProjectID {
+		return nil, fmt.Errorf("pubsub client project %q does not match ProjectID %q", p.client.Project(), cfg.ProjectID)
 	}
 
 	if p.createResources {
@@ -268,11 +290,14 @@ func (p *Producer) CancelRequests(_ context.Context, requestIDs []string) error 
 	return api.ErrNotSupported
 }
 
-// GetResult blocks until a result matching this producer's result_route is
-// delivered or ctx is cancelled. The first call starts one Receive. Later
-// calls drain that stream, and the message is acknowledged only after this
-// call takes it. If Receive returns an error, this call returns that error
-// and the next call starts a new Receive.
+// GetResult blocks until a result for this producer's result_route arrives, a
+// dead-lettered request is delivered, or ctx is cancelled. The first call
+// starts a receive on the result subscription and one on the dead-letter
+// subscription. Later calls drain that stream. The message is acknowledged
+// only after this call takes it, and that ack is issued before the receive
+// returns. A message not taken within resultMaxExtension is redelivered.
+// If a receive returns an error, this call returns that error. The error stays
+// on that stream, and the next call starts a new one.
 func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
@@ -280,7 +305,10 @@ func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
 	if err := p.errIfClosed(); err != nil {
 		return nil, err
 	}
-	done := p.ensureReceive()
+	stream := p.ensureReceive()
+	if stream == nil {
+		return nil, errProducerClosed
+	}
 
 	// A result already in the buffer is handed off before a dead stream.
 	select {
@@ -294,7 +322,7 @@ func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
 		return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
 	case <-p.closed:
 		return nil, errProducerClosed
-	case <-done:
+	case <-stream.done:
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
 		}
@@ -305,7 +333,7 @@ func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
 		case item := <-p.results:
 			return takeResult(item)
 		default:
-			return nil, p.resultStreamErr()
+			return nil, p.streamErr(stream)
 		}
 	case item := <-p.results:
 		return takeResult(item)
@@ -322,47 +350,97 @@ func takeResult(item receivedResult) (*api.ResultMessage, error) {
 	return item.result, nil
 }
 
-// ensureReceive starts a Receive unless one is already running. A previous
-// stream that returned an error does not stick; the next call starts another.
-func (p *Producer) ensureReceive() <-chan struct{} {
+// ensureReceive starts the result and dead-letter receives unless they are
+// already running. A stream that returned an error keeps that error. The next
+// call starts another stream instead of clearing it.
+func (p *Producer) ensureReceive() *resultStream {
 	p.recvMu.Lock()
 	defer p.recvMu.Unlock()
 	select {
 	case <-p.closed:
-		return p.closed
+		return nil
 	default:
 	}
 	if p.receiving {
-		return p.streamDone
+		return p.stream
 	}
 	p.receiving = true
-	p.recvErr = nil
-	done := make(chan struct{})
-	p.streamDone = done
+	stream := &resultStream{done: make(chan struct{})}
+	p.stream = stream
 	p.recvWG.Add(1)
-	go p.receiveResults(p.recvCtx, done)
-	return done
+	go p.receiveResults(p.recvCtx, stream)
+	return stream
 }
 
-func (p *Producer) receiveResults(ctx context.Context, done chan struct{}) {
+func (p *Producer) receiveResults(ctx context.Context, stream *resultStream) {
 	defer p.recvWG.Done()
-	defer close(done)
+	defer close(stream.done)
 
-	sub := p.client.Subscriber(p.resultSubscriptionID)
-	sub.ReceiveSettings.MaxOutstandingMessages = resultReceiveBuffer
-	sub.ReceiveSettings.NumGoroutines = 1
-	err := sub.Receive(ctx, p.enqueueResult)
+	err := p.receiveSubscriptions(ctx)
 
 	p.recvMu.Lock()
 	p.receiving = false
 	if err != nil && ctx.Err() == nil {
-		p.recvErr = err
+		stream.err = err
 	}
 	p.recvMu.Unlock()
 }
 
+func (p *Producer) receiveSubscriptions(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	subs := []struct {
+		id string
+		fn func(context.Context, *pubsub.Message)
+	}{
+		{p.resultSubscriptionID, p.enqueueResult},
+		{p.deadLetterSubscriptionID, p.enqueueDeadLetter},
+	}
+	for _, sub := range subs {
+		wg.Add(1)
+		go func(id string, fn func(context.Context, *pubsub.Message)) {
+			defer wg.Done()
+			err := p.receiveSubscription(ctx, id, fn)
+			if err != nil && ctx.Err() == nil {
+				errCh <- err
+				cancel()
+			}
+		}(sub.id, sub.fn)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		return err
+	}
+	return nil
+}
+
+func (p *Producer) receiveSubscription(ctx context.Context, subID string, fn func(context.Context, *pubsub.Message)) error {
+	sub := p.client.Subscriber(subID)
+	sub.ReceiveSettings.MaxOutstandingMessages = resultReceiveBuffer
+	sub.ReceiveSettings.NumGoroutines = 1
+	sub.ReceiveSettings.MaxExtension = resultMaxExtension
+	if err := sub.Receive(ctx, fn); err != nil {
+		return fmt.Errorf("receive %s: %w", subID, err)
+	}
+	return nil
+}
+
 func (p *Producer) enqueueResult(ctx context.Context, msg *pubsub.Message) {
-	item := decodeResult(msg)
+	p.deliver(ctx, msg, decodeResult(msg))
+}
+
+func (p *Producer) enqueueDeadLetter(ctx context.Context, msg *pubsub.Message) {
+	p.deliver(ctx, msg, decodeDeadLetter(msg))
+}
+
+// deliver queues a message and holds the receive callback until it is acked
+// or nacked. An ack issued after Receive has returned is dropped by the
+// client, so the callback stays inside Receive until the handoff settles.
+func (p *Producer) deliver(ctx context.Context, msg *pubsub.Message, item receivedResult) {
 	if item.err != nil {
 		// Poison is acked here so it is not redelivered.
 		msg.Ack()
@@ -372,8 +450,26 @@ func (p *Producer) enqueueResult(ctx context.Context, msg *pubsub.Message) {
 		}
 		return
 	}
+
+	var once sync.Once
+	settled := make(chan struct{})
+	finish := func(ack bool) {
+		once.Do(func() {
+			if ack {
+				msg.Ack()
+			} else {
+				msg.Nack()
+			}
+			close(settled)
+		})
+	}
 	select {
-	case p.results <- receivedResult{result: item.result, ack: msg.Ack, nack: msg.Nack}:
+	case p.results <- receivedResult{
+		result: item.result,
+		ack:    func() { finish(true) },
+		nack:   func() { finish(false) },
+	}:
+		<-settled
 	case <-ctx.Done():
 		msg.Nack()
 	}
@@ -390,15 +486,24 @@ func decodeResult(msg *pubsub.Message) receivedResult {
 	return receivedResult{result: &result}
 }
 
-func (p *Producer) resultStreamErr() error {
+func decodeDeadLetter(msg *pubsub.Message) receivedResult {
+	var req api.RequestMessage
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return receivedResult{err: fmt.Errorf("unmarshal dead-lettered request: %w", err)}
+	}
+	if req.ID == "" {
+		return receivedResult{err: errors.New("dead-lettered request missing 'id' field")}
+	}
+	result := api.NewErrorResult(&req, api.InternalRouting{}, api.ErrCodeDeadLettered, deadLetterMessage)
+	return receivedResult{result: &result}
+}
+
+func (p *Producer) streamErr(stream *resultStream) error {
 	if err := p.errIfClosed(); err != nil {
 		return err
 	}
-	p.recvMu.Lock()
-	err := p.recvErr
-	p.recvMu.Unlock()
-	if err != nil {
-		return fmt.Errorf("failed to get result: %w", err)
+	if stream != nil && stream.err != nil {
+		return fmt.Errorf("failed to get result: %w", stream.err)
 	}
 	return errors.New("failed to get result: receive ended without a message")
 }
@@ -421,7 +526,10 @@ func (p *Producer) Close() error {
 		p.recvMu.Lock()
 		p.recvCancel()
 		close(p.closed)
-		done := p.streamDone
+		var done <-chan struct{}
+		if p.stream != nil {
+			done = p.stream.done
+		}
 		p.recvMu.Unlock()
 
 		drained := make(chan struct{})
@@ -497,17 +605,18 @@ func validateConfig(cfg *Config) error {
 	if cfg.ResultRoute == "" {
 		return errors.New("ResultRoute is required")
 	}
-	if cfg.ResultSubscriptionID == "" {
-		// The route is the subscription ID in this case, so it has to be a
-		// legal Pub/Sub resource name as well as a filter value.
-		if err := validateResourceID("ResultRoute", cfg.ResultRoute); err != nil {
-			return err
-		}
-		cfg.ResultSubscriptionID = cfg.ResultRoute
-	} else if err := validateResourceID("ResultSubscriptionID", cfg.ResultSubscriptionID); err != nil {
+	// The filter quotes the route. %q escapes are not Pub/Sub filter syntax,
+	// so the route has to stay inside the resource-ID charset even when the
+	// subscription ID is set explicitly.
+	if err := validateResourceID("ResultRoute", cfg.ResultRoute); err != nil {
 		return err
 	}
 	if err := validateResultRouteFilter(cfg.ResultRoute); err != nil {
+		return err
+	}
+	if cfg.ResultSubscriptionID == "" {
+		cfg.ResultSubscriptionID = cfg.ResultRoute
+	} else if err := validateResourceID("ResultSubscriptionID", cfg.ResultSubscriptionID); err != nil {
 		return err
 	}
 	if cfg.DeadLetterTopicID == "" {
@@ -516,16 +625,45 @@ func validateConfig(cfg *Config) error {
 	if err := validateResourceID("DeadLetterTopicID", cfg.DeadLetterTopicID); err != nil {
 		return err
 	}
-	if cfg.DeadLetterSubscriptionID == "" {
-		cfg.DeadLetterSubscriptionID = cfg.DeadLetterTopicID + "-sub"
+	composedDLQSub := cfg.DeadLetterSubscriptionID == ""
+	if composedDLQSub {
+		cfg.DeadLetterSubscriptionID = cfg.DeadLetterTopicID + "-" + cfg.ResultRoute
 	}
 	if err := validateResourceID("DeadLetterSubscriptionID", cfg.DeadLetterSubscriptionID); err != nil {
+		if composedDLQSub {
+			return fmt.Errorf("default DeadLetterSubscriptionID %q is invalid: %w; set DeadLetterSubscriptionID", cfg.DeadLetterSubscriptionID, err)
+		}
 		return err
 	}
 	if cfg.MaxDeliveryAttempts == 0 {
 		cfg.MaxDeliveryAttempts = defaultDeliveryAttempts
 	} else if cfg.MaxDeliveryAttempts < minDeliveryAttempts || cfg.MaxDeliveryAttempts > maxDeliveryAttempts {
 		return fmt.Errorf("MaxDeliveryAttempts must be between %d and %d", minDeliveryAttempts, maxDeliveryAttempts)
+	}
+	if err := requireDistinct("RequestTopicID", cfg.RequestTopicID, "DeadLetterTopicID", cfg.DeadLetterTopicID); err != nil {
+		return err
+	}
+	if err := requireDistinct("RequestTopicID", cfg.RequestTopicID, "ResultTopicID", cfg.ResultTopicID); err != nil {
+		return err
+	}
+	if err := requireDistinct("DeadLetterTopicID", cfg.DeadLetterTopicID, "ResultTopicID", cfg.ResultTopicID); err != nil {
+		return err
+	}
+	if err := requireDistinct("RequestSubscriptionID", cfg.RequestSubscriptionID, "ResultSubscriptionID", cfg.ResultSubscriptionID); err != nil {
+		return err
+	}
+	if err := requireDistinct("RequestSubscriptionID", cfg.RequestSubscriptionID, "DeadLetterSubscriptionID", cfg.DeadLetterSubscriptionID); err != nil {
+		return err
+	}
+	if err := requireDistinct("ResultSubscriptionID", cfg.ResultSubscriptionID, "DeadLetterSubscriptionID", cfg.DeadLetterSubscriptionID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func requireDistinct(aName, aValue, bName, bValue string) error {
+	if aValue == bValue {
+		return fmt.Errorf("%s and %s must differ", aName, bName)
 	}
 	return nil
 }
