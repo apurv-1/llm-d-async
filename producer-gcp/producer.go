@@ -160,7 +160,6 @@ type resultStream struct {
 
 type receivedResult struct {
 	result *api.ResultMessage
-	err    error
 	ack    func()
 	nack   func()
 }
@@ -345,9 +344,6 @@ func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
 }
 
 func takeResult(item receivedResult) (*api.ResultMessage, error) {
-	if item.err != nil {
-		return nil, item.err
-	}
 	if item.ack != nil {
 		item.ack()
 	}
@@ -441,23 +437,25 @@ func (p *Producer) receiveSubscription(ctx context.Context, subID string, fn fun
 }
 
 func (p *Producer) enqueueResult(ctx context.Context, msg *pubsub.Message) {
-	p.deliver(ctx, msg, decodeResult(msg))
+	result, err := decodeResult(msg)
+	p.deliver(ctx, msg, result, err)
 }
 
 func (p *Producer) enqueueDeadLetter(ctx context.Context, msg *pubsub.Message) {
-	p.deliver(ctx, msg, decodeDeadLetter(msg))
+	result, err := decodeDeadLetter(msg)
+	p.deliver(ctx, msg, result, err)
 }
 
 // deliver queues a message and holds the receive callback until it is acked
 // or nacked. An ack issued after Receive has returned is dropped by the
 // client, so the callback stays inside Receive until the handoff settles.
-func (p *Producer) deliver(ctx context.Context, msg *pubsub.Message, item receivedResult) {
-	if item.err != nil {
+func (p *Producer) deliver(ctx context.Context, msg *pubsub.Message, result *api.ResultMessage, err error) {
+	if err != nil {
 		// Poison is acked and skipped. Surfacing it from GetResult stops a
 		// caller that returns on the first non-context error, and the rest
 		// of the subscription is then left unconsumed.
 		msg.Ack()
-		p.logger.Error(item.err, "skipping undecodable message", "id", msg.ID)
+		p.logger.Error(err, "skipping undecodable message", "id", msg.ID)
 		return
 	}
 
@@ -475,7 +473,7 @@ func (p *Producer) deliver(ctx context.Context, msg *pubsub.Message, item receiv
 	}
 	select {
 	case p.results <- receivedResult{
-		result: item.result,
+		result: result,
 		ack:    func() { finish(true) },
 		nack:   func() { finish(false) },
 	}:
@@ -485,27 +483,27 @@ func (p *Producer) deliver(ctx context.Context, msg *pubsub.Message, item receiv
 	}
 }
 
-func decodeResult(msg *pubsub.Message) receivedResult {
+func decodeResult(msg *pubsub.Message) (*api.ResultMessage, error) {
 	var result api.ResultMessage
 	if err := json.Unmarshal(msg.Data, &result); err != nil {
-		return receivedResult{err: fmt.Errorf("unmarshal result: %w", err)}
+		return nil, fmt.Errorf("unmarshal result: %w", err)
 	}
 	if result.ID == "" {
-		return receivedResult{err: errors.New("result missing 'id' field")}
+		return nil, errors.New("result missing 'id' field")
 	}
-	return receivedResult{result: &result}
+	return &result, nil
 }
 
-func decodeDeadLetter(msg *pubsub.Message) receivedResult {
+func decodeDeadLetter(msg *pubsub.Message) (*api.ResultMessage, error) {
 	var req api.RequestMessage
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return receivedResult{err: fmt.Errorf("unmarshal dead-lettered request: %w", err)}
+		return nil, fmt.Errorf("unmarshal dead-lettered request: %w", err)
 	}
 	if req.ID == "" {
-		return receivedResult{err: errors.New("dead-lettered request missing 'id' field")}
+		return nil, errors.New("dead-lettered request missing 'id' field")
 	}
 	result := api.NewErrorResult(&req, api.InternalRouting{}, api.ErrCodeDeadLettered, deadLetterMessage)
-	return receivedResult{result: &result}
+	return &result, nil
 }
 
 func (p *Producer) streamErr(stream *resultStream) error {

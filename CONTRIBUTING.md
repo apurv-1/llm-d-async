@@ -137,10 +137,10 @@ git push origin v0.8.0
 
 3. The `CI - Tag Go Submodules` workflow automatically creates the prefixed tags required by Go modules (e.g. `api/v0.8.0`, `pipeline/v0.8.0`, `producer/v0.8.0`, `producer-gcp/v0.8.0`, `producer-sql/v0.8.0`).
 
-`producer` and `producer-gcp` import symbols that are not in the published `api/v1.0.0` tag: `Producer`, `ResultRouteAttribute`, `ErrCodeDeadLettered`, and `BackfillResultMetadata`.
-`make set-version` rewrites every cross-module `require` before those tags are created, and the tag workflow creates `api/vX.Y.Z`, `producer/vX.Y.Z`, and `producer-gcp/vX.Y.Z` from the same commit.
-Do not tag `producer` or `producer-gcp` against `api/v1.0.0`.
-An external consumer does not see the `replace` directives in this repo, so a require on `api v1.0.0` fails to compile once it leaves the workspace.
+`producer` and `producer-gcp` require `api` at pseudo-version `v1.0.1-0.20261027063923-75f85ab81c04`, the commit that added `Producer`, `ResultRouteAttribute`, `ErrCodeDeadLettered`, and `BackfillResultMetadata`.
+The published `api/v1.0.0` tag does not contain those symbols, and a consumer does not see the `replace` directives in this repo.
+On release, tag `api` first, then point `producer` and `producer-gcp` at that tag.
+`make set-version` rewrites the requires before those tags are pushed.
 
 Go requires sub-module tags to carry the directory prefix.
 See [Managing module source](https://go.dev/doc/modules/managing-source) for details.

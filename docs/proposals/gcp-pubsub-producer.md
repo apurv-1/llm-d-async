@@ -49,8 +49,9 @@ On Pub/Sub, every producer on a result topic would otherwise see every result.
    There is no Redis-style `InternalRequest` envelope.
 4. `resultWorker` stamps that same `result_route` value as the only result attribute.
    Each producer creates a result subscription filtered on `attributes.result_route = "<route>"`.
-5. `NewProducer` (default) idempotently creates the request topic, DLQ topic and subscription, request subscription, result topic, and this producer's result subscription.
-   `AlreadyExists` is success after verifying the existing subscription's topic, a required filter, and a required dead-letter topic.
+5. `NewProducer` (default) validates an existing request subscription, then idempotently creates the request topic, DLQ topic and subscription, request subscription, result topic, and this producer's result subscription.
+   `AlreadyExists` is success after verifying the existing subscription's topic, a required filter, and a dead-letter topic when one is set.
+   A missing dead-letter policy is logged and left unchanged.
    `WithoutCreateResources` skips provisioning.
 
 ## Design Details
@@ -125,11 +126,9 @@ On create, the request subscription is configured as the [transports reference](
 - expiration policy with no TTL, so the processor subscription never expires
 
 `MaxDeliveryAttempts` must be between 5 and 100.
-The processor Nacks a request when a retry is requested, and each Nack counts as a delivery attempt.
-A refusal does not Nack.
-The message stays leased, and the gate is applied again on that same delivery every 10 seconds.
-The request subscriber sets `MaxExtension` to 60 minutes, the Pub/Sub client default, so a saturation longer than that can still redeliver the request once.
-Raising that cap would also hold in-flight inference on the same subscriber, so it stays at the default.
+The processor Nacks a request when a gate refuses it and when a retry is requested, and each Nack counts as a delivery attempt.
+A refusal waits 10 seconds, then Nacks.
+The receive callback returns immediately, so the refusal does not hold an outstanding-message slot.
 The Pub/Sub minimum of 5 still dead-letters a live request that keeps being retried while a pool stays saturated, and no result is ever published.
 100 is the maximum Pub/Sub allows, so that is the default.
 
@@ -186,10 +185,9 @@ A publish-only identity should use `WithoutCreateResources` and leave provisioni
 The producer sets that attribute to the configured route.
 Caller metadata is not copied onto attributes, because attribute maps have hard size limits the JSON body does not.
 The processor copies request attributes into `RequestMessage.Metadata`, which overwrites a caller-supplied `result_route`, and `NewHTTPResult` / `NewErrorResult` alias that metadata onto `ResultMessage.Metadata`.
-On a gate drop, `api.BackfillResultMetadata` copies request metadata onto the result and then applies the gate's keys, so a missing `result_route` is filled in and a key the gate set wins.
+On a gate drop, `api.NewDroppedResult` copies request metadata onto the result and then applies the gate's keys, so a missing `result_route` is filled in and a key the gate set wins.
 The Pub/Sub flow gate, the worker pool gate, the Redis sorted-set flow, and the SQL flow all call it.
 A gate that only fills `Metadata["result_route"]` on the tier path is not enough, because a pool-gate drop publishes through the same result channel.
-The tier-priority admission gate aliases the request metadata, the same way those constructors do.
 `resultWorker` reads only `Metadata["result_route"]` and publishes it as a Pub/Sub attribute.
 Requests with no route keep today's empty attributes, so existing e2e publishers and unfiltered result subscriptions keep working.
 

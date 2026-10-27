@@ -22,6 +22,21 @@ type subscriptionSpec struct {
 }
 
 func (p *Producer) ensureResources(ctx context.Context) error {
+	requestSub := subscriptionSpec{
+		id:                 p.cfg.RequestSubscriptionID,
+		topicID:            p.cfg.RequestTopicID,
+		enableExactlyOnce:  true,
+		ackDeadlineSeconds: requestAckDeadlineSeconds,
+		retry:              true,
+		deadLetterTopicID:  p.cfg.DeadLetterTopicID,
+		neverExpire:        true,
+	}
+	// An existing request subscription is checked before the DLQ topic and
+	// per-route subscription are created. A mismatch must not leave those behind.
+	if err := p.validateExistingSubscription(ctx, requestSub); err != nil {
+		return err
+	}
+
 	for _, topicID := range []string{p.cfg.RequestTopicID, p.cfg.DeadLetterTopicID, p.cfg.ResultTopicID} {
 		if err := p.ensureTopic(ctx, topicID); err != nil {
 			return err
@@ -37,16 +52,6 @@ func (p *Producer) ensureResources(ctx context.Context) error {
 	}
 	if err := p.ensureSubscription(ctx, dlqSub); err != nil {
 		return err
-	}
-
-	requestSub := subscriptionSpec{
-		id:                 p.cfg.RequestSubscriptionID,
-		topicID:            p.cfg.RequestTopicID,
-		enableExactlyOnce:  true,
-		ackDeadlineSeconds: requestAckDeadlineSeconds,
-		retry:              true,
-		deadLetterTopicID:  p.cfg.DeadLetterTopicID,
-		neverExpire:        true,
 	}
 	if err := p.ensureSubscription(ctx, requestSub); err != nil {
 		return err
@@ -88,6 +93,34 @@ func (p *Producer) ensureSubscription(ctx context.Context, spec subscriptionSpec
 	if getErr != nil {
 		return fmt.Errorf("get existing subscription %q: %w", spec.id, getErr)
 	}
+	if err := p.subscriptionMismatch(existing, spec); err != nil {
+		return err
+	}
+	if spec.deadLetterTopicID != "" && existing.GetDeadLetterPolicy().GetDeadLetterTopic() == "" {
+		p.logger.Info("subscription has no dead-letter policy; leaving it unchanged",
+			"subscription", spec.id,
+			"wantDeadLetterTopic", topicResource(p.cfg.ProjectID, spec.deadLetterTopicID))
+	}
+	return nil
+}
+
+// validateExistingSubscription checks a subscription that is already present.
+// NotFound is success: ensureSubscription creates it after DLQ resources exist.
+func (p *Producer) validateExistingSubscription(ctx context.Context, spec subscriptionSpec) error {
+	existing, err := p.client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
+		Subscription: subscriptionResource(p.cfg.ProjectID, spec.id),
+	})
+	if status.Code(err) == codes.NotFound {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get existing subscription %q: %w", spec.id, err)
+	}
+	return p.subscriptionMismatch(existing, spec)
+}
+
+func (p *Producer) subscriptionMismatch(existing *pubsubpb.Subscription, spec subscriptionSpec) error {
+	wantTopic := topicResource(p.cfg.ProjectID, spec.topicID)
 	if existing.GetTopic() != wantTopic {
 		return fmt.Errorf("subscription %q exists but is attached to topic %q, want %q", spec.id, existing.GetTopic(), wantTopic)
 	}
@@ -97,7 +130,8 @@ func (p *Producer) ensureSubscription(ctx context.Context, spec subscriptionSpec
 	if spec.deadLetterTopicID != "" {
 		gotDLQ := existing.GetDeadLetterPolicy().GetDeadLetterTopic()
 		wantDLQ := topicResource(p.cfg.ProjectID, spec.deadLetterTopicID)
-		if gotDLQ != wantDLQ {
+		// A missing policy is left unchanged. A policy that points somewhere else is not.
+		if gotDLQ != "" && gotDLQ != wantDLQ {
 			return fmt.Errorf("subscription %q exists but dead-letters to %q, want %q", spec.id, gotDLQ, wantDLQ)
 		}
 	}

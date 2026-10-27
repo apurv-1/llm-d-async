@@ -16,7 +16,9 @@ import (
 	"github.com/llm-d/llm-d-async/api"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const testProject = "test-project"
@@ -298,9 +300,14 @@ func TestNewProducerRejectsTopicMismatch(t *testing.T) {
 	if !strings.Contains(err.Error(), "attached to topic") {
 		t.Errorf("error = %q, want topic mismatch", err)
 	}
+	if _, getErr := client.TopicAdminClient.GetTopic(ctx, &pubsubpb.GetTopicRequest{
+		Topic: topicResource(testProject, "requests-dlq"),
+	}); status.Code(getErr) != codes.NotFound {
+		t.Fatalf("dlq topic created on mismatch: %v", getErr)
+	}
 }
 
-func TestNewProducerRejectsMissingDeadLetterPolicy(t *testing.T) {
+func TestNewProducerLeavesMissingDeadLetterPolicy(t *testing.T) {
 	client := newFakeClient(t)
 	ctx := context.Background()
 	cfg := testConfig()
@@ -314,9 +321,52 @@ func TestNewProducerRejectsMissingDeadLetterPolicy(t *testing.T) {
 		t.Fatalf("create request subscription: %v", err)
 	}
 
+	newTestProducer(t, client, cfg)
+
+	reqSub, err := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
+		Subscription: subscriptionResource(testProject, cfg.RequestSubscriptionID),
+	})
+	if err != nil {
+		t.Fatalf("get request subscription: %v", err)
+	}
+	if reqSub.GetDeadLetterPolicy() != nil {
+		t.Fatalf("existing subscription DLQ = %+v, want unchanged", reqSub.GetDeadLetterPolicy())
+	}
+}
+
+func TestNewProducerRejectsDeadLetterTopicMismatch(t *testing.T) {
+	client := newFakeClient(t)
+	ctx := context.Background()
+	cfg := testConfig()
+	for _, id := range []string{cfg.RequestTopicID, "other-dlq"} {
+		if _, err := client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: topicResource(testProject, id)}); err != nil {
+			t.Fatalf("create topic %s: %v", id, err)
+		}
+	}
+	if _, err := client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name:  subscriptionResource(testProject, cfg.RequestSubscriptionID),
+		Topic: topicResource(testProject, cfg.RequestTopicID),
+		DeadLetterPolicy: &pubsubpb.DeadLetterPolicy{
+			DeadLetterTopic:     topicResource(testProject, "other-dlq"),
+			MaxDeliveryAttempts: 5,
+		},
+	}); err != nil {
+		t.Fatalf("create request subscription: %v", err)
+	}
+
 	_, err := NewProducer(context.Background(), cfg, WithPubSubClient(client))
 	if err == nil || !strings.Contains(err.Error(), "dead-letters") {
 		t.Fatalf("error = %v, want dead-letter topic mismatch", err)
+	}
+	if _, getErr := client.TopicAdminClient.GetTopic(ctx, &pubsubpb.GetTopicRequest{
+		Topic: topicResource(testProject, cfg.RequestTopicID+"-dlq"),
+	}); status.Code(getErr) != codes.NotFound {
+		t.Fatalf("dlq topic created on mismatch: %v", getErr)
+	}
+	if _, getErr := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
+		Subscription: subscriptionResource(testProject, cfg.RequestTopicID+"-dlq-"+cfg.ResultRoute),
+	}); status.Code(getErr) != codes.NotFound {
+		t.Fatalf("dlq subscription created on mismatch: %v", getErr)
 	}
 }
 

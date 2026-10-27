@@ -71,11 +71,9 @@ func TestTierPriorityAdmissionGate_Apply(t *testing.T) {
 		assert.Equal(t, pipeline.ActionDrop, res.Action)
 		assert.NotNil(t, res.Result)
 		assert.Contains(t, res.Result.Payload, `"code": 429`)
-		assert.Equal(t, "producer-a", res.Result.Metadata[api.ResultRouteAttribute])
-		assert.Equal(t, "alice", res.Result.Metadata["userid"])
-		// The result aliases the request map, same as api.NewErrorResult.
-		res.Result.Metadata["userid"] = "bob"
-		assert.Equal(t, "bob", req.Metadata["userid"])
+		// Routing metadata is filled by api.NewDroppedResult when the transport publishes.
+		assert.Nil(t, res.Result.Metadata)
+		assert.Equal(t, "alice", req.Metadata["userid"])
 	})
 
 	t.Run("Saturated - Overflow Async - Refuse", func(t *testing.T) {
