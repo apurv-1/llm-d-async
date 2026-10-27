@@ -4,7 +4,6 @@ go 1.26.0
 
 require (
 	cloud.google.com/go/pubsub/v2 v2.7.0
-	github.com/go-logr/logr v1.4.4
 	github.com/llm-d/llm-d-async/api v1.0.0
 	google.golang.org/api v0.297.0
 	google.golang.org/grpc v1.83.2
@@ -19,6 +18,7 @@ require (
 	cloud.google.com/go/iam v1.12.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect

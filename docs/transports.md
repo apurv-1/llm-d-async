@@ -363,30 +363,18 @@ An injected Pub/Sub client must already be for `ProjectID`.
 By default `NewProducer` idempotently creates the request topic, the request subscription (exactly-once, exponential backoff, DLQ, never-expire), the result topic, this producer's filtered result subscription (never-expire), and a DLQ topic plus a filtered DLQ subscription.
 The DLQ subscription defaults to `<DeadLetterTopicID>-<ResultRoute>`, so producers on one dead-letter topic do not share a subscription.
 `GetResult` reads that subscription and returns a dead-lettered request as an error result with `error_code` `DEAD_LETTERED`.
-`AlreadyExists` is success after checking that an existing subscription is attached to the expected topic, that a required filter matches, and that a required dead-letter topic matches.
-It does not change the expiration policy, the dead-letter attempt count, or the dead-letter topic.
+`AlreadyExists` is success after checking that an existing subscription is attached to the expected topic and, when a filter is required, that the filter matches.
+It does not change the expiration policy or the dead-letter attempt count.
 A subscription created with an inactivity TTL keeps that TTL.
 A subscription created with fewer delivery attempts keeps that limit.
 An existing result or DLQ subscription whose filter does not match is an error.
-An existing request subscription with no dead-letter policy, or one that dead-letters somewhere else, is an error.
-Delete it once so the next `NewProducer` creates it with the route filter, the configured dead-letter topic, no expiry, and the configured attempt count.
-The request subscription is shared by every publisher on that topic.
-Exactly-once delivery and the dead-letter policy apply to those publishers too.
-A legacy publisher that does not set `result_route` still has poison requests copied onto the dead-letter topic.
-The only DLQ subscriptions are filtered on `result_route`, so a message with no route matches none of them.
+Delete it once so the next `NewProducer` creates it with the route filter, no expiry, and the configured attempt count.
 The request subscription dead-letters after `MaxDeliveryAttempts` deliveries.
 The default is 100, which is the Pub/Sub maximum, and the allowed range is 5-100.
-The processor Nacks on retry, and each Nack counts, so the minimum of 5 still drops a live request that keeps failing and never publishes a result.
-A refusal does not Nack.
-The message stays leased, and the gate is applied again on that same delivery every 10 seconds.
-The request subscriber stops extending the lease after 60 minutes, which is the Pub/Sub client default, so a saturation longer than that can redeliver the request once.
+The processor Nacks on gate refusal and on retry, and each Nack counts, so the minimum of 5 drops a live request while a pool stays saturated and never publishes a result.
 A result or dead letter that `GetResult` has not taken within 60 minutes is redelivered.
 That is the Pub/Sub lease extension, and the producer sets it explicitly.
-A result or dead letter that cannot be decoded is acknowledged and skipped.
-`GetResult` returns the next decodable message, so one poison message does not stop the caller.
-After a receive error, the next `GetResult` reuses that error for one second before opening another pair of StreamingPulls.
-On a gate drop, `api.BackfillResultMetadata` copies request metadata onto the result and then applies the gate's keys.
-That runs for the Pub/Sub flow gate, the worker pool gate, the Redis sorted-set flow, and the SQL flow, so `result_route` is still published when the gate built its own result.
+On a gate drop, the worker copies request metadata onto the result and then applies the gate's keys, so `result_route` is still published when the gate built its own result.
 Use `WithoutCreateResources` for a publish-only identity.
 See [the GCP Pub/Sub producer proposal](proposals/gcp-pubsub-producer.md).
 

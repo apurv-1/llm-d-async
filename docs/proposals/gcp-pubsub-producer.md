@@ -50,7 +50,7 @@ On Pub/Sub, every producer on a result topic would otherwise see every result.
 4. `resultWorker` stamps that same `result_route` value as the only result attribute.
    Each producer creates a result subscription filtered on `attributes.result_route = "<route>"`.
 5. `NewProducer` (default) idempotently creates the request topic, DLQ topic and subscription, request subscription, result topic, and this producer's result subscription.
-   `AlreadyExists` is success after verifying the existing subscription's topic, a required filter, and a required dead-letter topic.
+   `AlreadyExists` is success after verifying the existing subscription's topic (and, for the result subscription, its filter).
    `WithoutCreateResources` skips provisioning.
 
 ## Design Details
@@ -125,18 +125,9 @@ On create, the request subscription is configured as the [transports reference](
 - expiration policy with no TTL, so the processor subscription never expires
 
 `MaxDeliveryAttempts` must be between 5 and 100.
-The processor Nacks a request when a retry is requested, and each Nack counts as a delivery attempt.
-A refusal does not Nack.
-The message stays leased, and the gate is applied again on that same delivery every 10 seconds.
-The request subscriber sets `MaxExtension` to 60 minutes, the Pub/Sub client default, so a saturation longer than that can still redeliver the request once.
-Raising that cap would also hold in-flight inference on the same subscriber, so it stays at the default.
-The Pub/Sub minimum of 5 still dead-letters a live request that keeps being retried while a pool stays saturated, and no result is ever published.
+The processor Nacks a request when a gate refuses it and when a retry is requested, and each Nack counts as a delivery attempt.
+The Pub/Sub minimum of 5 dead-letters a live request while a pool stays saturated, and no result is ever published.
 100 is the maximum Pub/Sub allows, so that is the default.
-
-The request subscription is shared by every publisher on the request topic.
-Exactly-once delivery and the dead-letter policy are properties of that subscription, so they apply to legacy publishers as well as this producer.
-A poison request that has no `result_route` is copied to the dead-letter topic.
-Every DLQ subscription this producer creates is filtered on `result_route`, so that message matches none of them and is not returned by `GetResult`.
 
 The emulator and `pstest` accept exactly-once but do not honor it.
 Tests assert the field is set, not the delivery effect.
@@ -146,8 +137,6 @@ An idle producer would otherwise lose the subscription, and every result publish
 The DLQ subscription never expires, so poison messages are not dropped by idle TTL.
 It is filtered on `result_route` and defaults to `<DeadLetterTopicID>-<ResultRoute>`.
 `GetResult` reads it and returns a dead-lettered request as an error result with `error_code` `DEAD_LETTERED`, then acknowledges it.
-A result or dead letter that cannot be decoded is acknowledged and skipped, and `GetResult` waits for the next decodable message.
-Pass `WithLogger` to record those skips. Without it the log is discarded and the skip still happens.
 Producers that share a route compete for those messages.
 A result or dead letter that `GetResult` has not taken within 60 minutes is redelivered.
 That is the Pub/Sub lease extension limit, and the producer sets `MaxExtension` to it.
@@ -161,8 +150,7 @@ With no deadline, provisioning stops after 30s.
 - Topic: treat as success.
 - Subscription: `GetSubscription` and fail if `topic` does not match.
 - Result subscription: also fail if `filter` does not match.
-- Request subscription: also fail if `dead_letter_policy.dead_letter_topic` does not match. A missing policy is an empty topic and fails the same check.
-- Other settings (exactly-once, retry, max delivery attempts, ack deadline, expiration) are not mutated on an existing subscription.
+- Other settings (exactly-once, retry, DLQ, including max delivery attempts, ack deadline, expiration) are not mutated on an existing subscription.
   Operators who created the processor subscription by hand keep their values.
   A subscription created with an inactivity TTL keeps that TTL.
   A subscription created with fewer delivery attempts keeps that limit.
@@ -186,9 +174,7 @@ A publish-only identity should use `WithoutCreateResources` and leave provisioni
 The producer sets that attribute to the configured route.
 Caller metadata is not copied onto attributes, because attribute maps have hard size limits the JSON body does not.
 The processor copies request attributes into `RequestMessage.Metadata`, which overwrites a caller-supplied `result_route`, and `NewHTTPResult` / `NewErrorResult` alias that metadata onto `ResultMessage.Metadata`.
-On a gate drop, `api.BackfillResultMetadata` copies request metadata onto the result and then applies the gate's keys, so a missing `result_route` is filled in and a key the gate set wins.
-The Pub/Sub flow gate, the worker pool gate, the Redis sorted-set flow, and the SQL flow all call it.
-A gate that only fills `Metadata["result_route"]` on the tier path is not enough, because a pool-gate drop publishes through the same result channel.
+On a gate drop, the Pub/Sub worker copies request metadata onto the result and then applies the gate's keys, so a missing `result_route` is filled in and a key the gate set wins.
 The tier-priority admission gate aliases the request metadata, the same way those constructors do.
 `resultWorker` reads only `Metadata["result_route"]` and publishes it as a Pub/Sub attribute.
 Requests with no route keep today's empty attributes, so existing e2e publishers and unfiltered result subscriptions keep working.
@@ -206,9 +192,7 @@ A result stays unacknowledged until `GetResult` hands it to the caller, so a cra
 The ack or nack is issued before that receive callback returns, so it is not dropped when the stream stops.
 A caller whose context is already cancelled returns without taking a result.
 If a receive returns an error, that call returns the error.
-The error stays on that stream.
-For the next second, `GetResult` returns the same error and does not open another pair of StreamingPulls.
-After that, the next `GetResult` starts a new stream.
+The error stays on that stream, and the next `GetResult` starts a new one.
 `SubmitRequest` may be called concurrently.
 `Close` stops the result receive, nacks anything still buffered, and stops the request publisher.
 When the producer owns the client, `Close` closes it too.

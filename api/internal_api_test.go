@@ -355,22 +355,6 @@ func assertRouting(t *testing.T, got, want InternalRouting) {
 	}
 }
 
-func TestBackfillResultMetadata(t *testing.T) {
-	if got := BackfillResultMetadata(nil, nil); got != nil {
-		t.Fatalf("empty backfill = %v, want nil", got)
-	}
-	request := map[string]string{ResultRouteAttribute: "route-1", "userid": "carol"}
-	result := map[string]string{"userid": "alice"}
-	got := BackfillResultMetadata(request, result)
-	if got[ResultRouteAttribute] != "route-1" || got["userid"] != "alice" {
-		t.Fatalf("backfill = %v", got)
-	}
-	got[ResultRouteAttribute] = "changed"
-	if request[ResultRouteAttribute] != "route-1" || result["userid"] != "alice" {
-		t.Fatalf("backfill aliased an input: request=%v result=%v", request, result)
-	}
-}
-
 func TestQueueScore(t *testing.T) {
 	const d = int64(1_790_000_000)
 	const maxDeadline = int64(1<<32 - 1)

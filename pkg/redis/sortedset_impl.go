@@ -946,7 +946,6 @@ func (r *RedisSortedSetFlow) processMessagesWithConfig(ctx context.Context, msgC
 			if verdict.Result != nil {
 				resultMsg = *verdict.Result
 				resultMsg.Routing = ir.InternalRouting
-				resultMsg.Metadata = api.BackfillResultMetadata(rview.ReqMetadata(), verdict.Result.Metadata)
 			} else {
 				resultMsg = api.NewGateDroppedResult(rview, ir.InternalRouting)
 			}

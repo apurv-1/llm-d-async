@@ -22,16 +22,16 @@ type subscriptionSpec struct {
 }
 
 func (p *Producer) ensureResources(ctx context.Context) error {
-	for _, topicID := range []string{p.cfg.RequestTopicID, p.cfg.DeadLetterTopicID, p.cfg.ResultTopicID} {
+	for _, topicID := range []string{p.requestTopicID, p.deadLetterTopicID, p.resultTopicID} {
 		if err := p.ensureTopic(ctx, topicID); err != nil {
 			return err
 		}
 	}
 
 	dlqSub := subscriptionSpec{
-		id:                 p.cfg.DeadLetterSubscriptionID,
-		topicID:            p.cfg.DeadLetterTopicID,
-		filter:             resultRouteFilter(p.cfg.ResultRoute),
+		id:                 p.deadLetterSubscriptionID,
+		topicID:            p.deadLetterTopicID,
+		filter:             resultRouteFilter(p.resultRoute),
 		ackDeadlineSeconds: resultAckDeadlineSeconds,
 		neverExpire:        true,
 	}
@@ -40,12 +40,12 @@ func (p *Producer) ensureResources(ctx context.Context) error {
 	}
 
 	requestSub := subscriptionSpec{
-		id:                 p.cfg.RequestSubscriptionID,
-		topicID:            p.cfg.RequestTopicID,
+		id:                 p.requestSubscriptionID,
+		topicID:            p.requestTopicID,
 		enableExactlyOnce:  true,
 		ackDeadlineSeconds: requestAckDeadlineSeconds,
 		retry:              true,
-		deadLetterTopicID:  p.cfg.DeadLetterTopicID,
+		deadLetterTopicID:  p.deadLetterTopicID,
 		neverExpire:        true,
 	}
 	if err := p.ensureSubscription(ctx, requestSub); err != nil {
@@ -53,9 +53,9 @@ func (p *Producer) ensureResources(ctx context.Context) error {
 	}
 
 	resultSub := subscriptionSpec{
-		id:                 p.cfg.ResultSubscriptionID,
-		topicID:            p.cfg.ResultTopicID,
-		filter:             resultRouteFilter(p.cfg.ResultRoute),
+		id:                 p.resultSubscriptionID,
+		topicID:            p.resultTopicID,
+		filter:             resultRouteFilter(p.resultRoute),
 		ackDeadlineSeconds: resultAckDeadlineSeconds,
 		neverExpire:        true,
 	}
@@ -63,7 +63,7 @@ func (p *Producer) ensureResources(ctx context.Context) error {
 }
 
 func (p *Producer) ensureTopic(ctx context.Context, topicID string) error {
-	name := topicResource(p.cfg.ProjectID, topicID)
+	name := topicResource(p.projectID, topicID)
 	_, err := p.client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: name})
 	if err == nil || status.Code(err) == codes.AlreadyExists {
 		return nil
@@ -72,9 +72,9 @@ func (p *Producer) ensureTopic(ctx context.Context, topicID string) error {
 }
 
 func (p *Producer) ensureSubscription(ctx context.Context, spec subscriptionSpec) error {
-	name := subscriptionResource(p.cfg.ProjectID, spec.id)
-	wantTopic := topicResource(p.cfg.ProjectID, spec.topicID)
-	_, err := p.client.SubscriptionAdminClient.CreateSubscription(ctx, spec.toProto(p.cfg.ProjectID, name, wantTopic, p.cfg.MaxDeliveryAttempts))
+	name := subscriptionResource(p.projectID, spec.id)
+	wantTopic := topicResource(p.projectID, spec.topicID)
+	_, err := p.client.SubscriptionAdminClient.CreateSubscription(ctx, spec.toProto(p.projectID, name, wantTopic, p.maxDeliveryAttempts))
 	if err == nil {
 		return nil
 	}
@@ -93,13 +93,6 @@ func (p *Producer) ensureSubscription(ctx context.Context, spec subscriptionSpec
 	}
 	if spec.filter != "" && existing.GetFilter() != spec.filter {
 		return fmt.Errorf("subscription %q exists but has filter %q, want %q", spec.id, existing.GetFilter(), spec.filter)
-	}
-	if spec.deadLetterTopicID != "" {
-		gotDLQ := existing.GetDeadLetterPolicy().GetDeadLetterTopic()
-		wantDLQ := topicResource(p.cfg.ProjectID, spec.deadLetterTopicID)
-		if gotDLQ != wantDLQ {
-			return fmt.Errorf("subscription %q exists but dead-letters to %q, want %q", spec.id, gotDLQ, wantDLQ)
-		}
 	}
 	return nil
 }

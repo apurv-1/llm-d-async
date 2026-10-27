@@ -529,7 +529,6 @@ func (f *Flow) dispatchPolled(ctx context.Context, q *queueRuntime, e polled, ba
 		if out.verdict.Result != nil {
 			result = *out.verdict.Result
 			result.Routing = ir.InternalRouting
-			result.Metadata = api.BackfillResultMetadata(ir.PublicRequest.ReqMetadata(), out.verdict.Result.Metadata)
 		}
 		pipeline.ReleaseGateReleases(out.releases)
 		return emit(result)
