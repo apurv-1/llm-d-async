@@ -77,25 +77,20 @@ func TestGating_EndToEnd(t *testing.T) {
 
 		// 2. Send Request 2 for User A (while Request 1 is still "in flight" in the gate)
 		msg2 := createMsg("req-2", "user-a")
-		deniedChan := make(chan bool, 1)
 		go func() {
 			receive := func(ctx context.Context, f func(context.Context, *pubsub.Message)) error {
-				// This should return immediately because Acquire fails
+				// Acquire fails. The callback holds the lease and retries the
+				// gate instead of Nacking, so this returns when ctx is cancelled.
 				f(ctx, msg2)
 				return nil
 			}
-			// We expect this to return without putting anything in 'ch'
 			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil, "")
-			deniedChan <- true
 		}()
 
 		select {
 		case <-ch:
 			t.Fatal("Request 2 should have been gated and not reached the channel")
-		case <-deniedChan:
-			// Success: processMessages returned (due to Nack) without sending to 'ch'
-		case <-time.After(1 * time.Second):
-			t.Fatal("Timeout waiting for req-2 to be denied")
+		case <-time.After(200 * time.Millisecond):
 		}
 
 		// 3. Complete Request 1
@@ -153,25 +148,22 @@ func TestGating_EndToEnd(t *testing.T) {
 			}
 		}
 
-		// 3rd request should be denied
+		// 3rd request should be denied. The callback holds the lease until ctx ends.
 		msg3 := createMsg("rl-3", "user-b")
-		deniedChan := make(chan bool, 1)
+		denyCtx, denyCancel := context.WithCancel(context.Background())
+		defer denyCancel()
 		go func() {
 			receive := func(ctx context.Context, f func(context.Context, *pubsub.Message)) error {
 				f(ctx, msg3)
 				return nil
 			}
-			_ = flow.processMessages(context.Background(), receive, "test-sub", "test-pool", ch, gate, nil, "")
-			deniedChan <- true
+			_ = flow.processMessages(denyCtx, receive, "test-sub", "test-pool", ch, gate, nil, "")
 		}()
 
 		select {
 		case <-ch:
 			t.Fatal("rl-3 should have been rate limited")
-		case <-deniedChan:
-			// Success
-		case <-time.After(1 * time.Second):
-			t.Fatal("Timeout waiting for rl-3 denial")
+		case <-time.After(200 * time.Millisecond):
 		}
 
 		// Wait for window to reset

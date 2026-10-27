@@ -568,6 +568,83 @@ func TestProcessMessages_DropForwardsGateMetadata(t *testing.T) {
 	_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil, "")
 }
 
+// refuseOnceGate refuses the first Apply and admits every later one.
+type refuseOnceGate struct {
+	mu      sync.Mutex
+	applies int
+}
+
+func (g *refuseOnceGate) Budget(ctx context.Context) float64 { return 1.0 }
+func (g *refuseOnceGate) Apply(ctx context.Context, msg *api.InternalRequest, releases *[]pipeline.GateReleaseFunc) (pipeline.Verdict, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.applies++
+	if g.applies == 1 {
+		return pipeline.Refuse(), nil
+	}
+	return pipeline.Continue(), nil
+}
+
+// TestProcessMessages_RefusalHoldsDelivery checks that a refused request is
+// dispatched on its first delivery once the gate admits it. A Nack would
+// redeliver it and spend a dead-letter attempt.
+func TestProcessMessages_RefusalHoldsDelivery(t *testing.T) {
+	client, _ := newFakePubSub(t)
+	ctx := context.Background()
+	topicName := "projects/" + testProject + "/topics/requests"
+	dlqName := "projects/" + testProject + "/topics/requests-dlq"
+	for _, name := range []string{topicName, dlqName} {
+		if _, err := client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: name}); err != nil {
+			t.Fatalf("create topic: %v", err)
+		}
+	}
+	if _, err := client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name:  "projects/" + testProject + "/subscriptions/requests-sub",
+		Topic: topicName,
+		DeadLetterPolicy: &pubsubpb.DeadLetterPolicy{
+			DeadLetterTopic:     dlqName,
+			MaxDeliveryAttempts: 5,
+		},
+	}); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	data, _ := json.Marshal(api.RequestMessage{ID: "req-1"})
+	if _, err := client.Publisher("requests").Publish(ctx, &pubsub.Message{Data: data}).Get(ctx); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	flow := &PubSubMQFlow{}
+	ch := make(chan *api.InternalRequest, 2)
+	gate := &refuseOnceGate{}
+	sub := client.Subscriber("requests-sub")
+	sub.ReceiveSettings.MaxOutstandingMessages = 1
+	sub.ReceiveSettings.NumGoroutines = 1
+
+	recvCtx, cancel := context.WithTimeout(ctx, refuseRecheckDelay+10*time.Second)
+	defer cancel()
+	go func() { _ = flow.processMessages(recvCtx, sub.Receive, "requests-sub", "test-pool", ch, gate, nil, "") }()
+
+	var got *api.InternalRequest
+	select {
+	case got = <-ch:
+	case <-recvCtx.Done():
+		t.Fatal("refused request was never dispatched")
+	}
+	if val, ok := resultChannels.Load(got.TransportCorrelationID); ok {
+		val.(chan bool) <- true
+	}
+	if got.RetryCount != 0 {
+		t.Fatalf("RetryCount = %d, want 0: the refusal was Nacked and redelivered", got.RetryCount)
+	}
+	gate.mu.Lock()
+	applies := gate.applies
+	gate.mu.Unlock()
+	if applies != 2 {
+		t.Fatalf("gate applied %d times, want 2 (refuse, then admit on the same delivery)", applies)
+	}
+}
+
 func TestResultWorkerStampsResultRouteAttribute(t *testing.T) {
 	client, _ := newFakePubSub(t)
 	ctx := context.Background()

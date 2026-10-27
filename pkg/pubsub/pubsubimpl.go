@@ -29,7 +29,14 @@ var pubSubClient *pubsub.Client
 
 var resultChannels sync.Map
 
-const quotaExceededNackDelay = 10 * time.Second
+// refuseRecheckDelay is how long a refused request stays leased before the
+// gate is applied again on the same delivery. A Nack would count toward the
+// dead-letter limit, so a long saturation is not allowed to burn attempts.
+const refuseRecheckDelay = 10 * time.Second
+
+// refuseLeaseExtension matches the Pub/Sub client default. It bounds how long
+// the receive keeps a message leased, including one the gate has refused.
+const refuseLeaseExtension = 60 * time.Minute
 
 type TopicConfig struct {
 	SubscriberID       string `json:"subscriber_id"`
@@ -502,24 +509,6 @@ func resultWorker(ctx context.Context, client *pubsub.Client, defaultTopicID str
 	}
 }
 
-// backfillResultMetadata copies request metadata, then result metadata.
-// A key the gate omitted, including result_route, is filled from the request.
-// A key the gate set wins. The returned map is new, so later reads do not
-// alias the request or the gate's map.
-func backfillResultMetadata(request, result map[string]string) map[string]string {
-	if len(request) == 0 && len(result) == 0 {
-		return nil
-	}
-	merged := make(map[string]string, len(request)+len(result))
-	for k, v := range request {
-		merged[k] = v
-	}
-	for k, v := range result {
-		merged[k] = v
-	}
-	return merged
-}
-
 // resultPublishAttributes returns the Pub/Sub attributes stamped on a result
 // publication. Only result_route is copied; caller metadata is not echoed.
 func resultPublishAttributes(msg api.ResultMessage) map[string]string {
@@ -615,6 +604,10 @@ func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.C
 		logger.V(logutil.DEFAULT).Info("PubSub MaxOutstandingMessages", "value", currBatchSize)
 		sub.ReceiveSettings.MaxOutstandingMessages = currBatchSize
 		sub.ReceiveSettings.NumGoroutines = 1
+		// A refused request stays leased and is retried on the same delivery.
+		// The client stops extending at MaxExtension, so this is also how long
+		// one delivery can sit in a stable saturation before Pub/Sub redelivers it.
+		sub.ReceiveSettings.MaxExtension = refuseLeaseExtension
 		if currBatchSize <= 0 {
 			// Same pre-dequeue back-pressure as the sorted-set path: with no
 			// outstanding-message slots the receive callback never runs, so
@@ -709,22 +702,28 @@ func (r *PubSubMQFlow) processMessages(ctx context.Context, receive receiveFunc,
 			return
 		}
 
-		if verdict.Action == pipeline.ActionRefuse {
+		for verdict.Action == pipeline.ActionRefuse {
 			reason := verdict.Reason
 			if reason == "" {
 				reason = metrics.ReasonGateClosed
 			}
 			metrics.RecordGateDecision(reason, "", subscriberID, poolID)
-			logger.V(logutil.DEBUG).Info("Quota exceeded or capacity full, delaying Nack", "msgID", msg.ID, "delay", quotaExceededNackDelay)
-			go func() {
-				select {
-				case <-time.After(quotaExceededNackDelay):
-					msg.Nack()
-				case <-ctx.Done():
-					msg.Nack()
-				}
-			}()
-			return
+			logger.V(logutil.DEBUG).Info("Quota exceeded or capacity full, extending the lease", "msgID", msg.ID, "recheck", refuseRecheckDelay)
+			select {
+			case <-ctx.Done():
+				msg.Nack()
+				return
+			case <-time.After(refuseRecheckDelay):
+			}
+			pipeline.ReleaseGateReleases(releases)
+			releases = nil
+			verdict, err = gate.Apply(ctx, ir, &releases)
+			if err != nil {
+				logger.V(logutil.DEFAULT).Error(err, "Gating failed")
+				metrics.RecordGateDecision(metrics.ReasonError, "", subscriberID, poolID)
+				msg.Nack()
+				return
+			}
 		}
 
 		if verdict.Action == pipeline.ActionDrop {
@@ -733,7 +732,7 @@ func (r *PubSubMQFlow) processMessages(ctx context.Context, receive receiveFunc,
 			if verdict.Result != nil {
 				resultMsg = *verdict.Result
 				resultMsg.Routing = ir.InternalRouting
-				resultMsg.Metadata = backfillResultMetadata(body.Metadata, verdict.Result.Metadata)
+				resultMsg.Metadata = api.BackfillResultMetadata(body.Metadata, verdict.Result.Metadata)
 			} else {
 				resultMsg = api.NewGateDroppedResult(&body, ir.InternalRouting)
 			}

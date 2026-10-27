@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/pubsub/v2"
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/api"
 )
 
@@ -21,10 +22,10 @@ const (
 	// Pub/Sub rejects a dead-letter policy outside this range.
 	minDeliveryAttempts int32 = 5
 	maxDeliveryAttempts int32 = 100
-	// defaultDeliveryAttempts is the Pub/Sub maximum. The processor Nacks a
-	// request when a gate refuses it and when a retry is requested, and each
-	// Nack counts. Five attempts, the minimum Pub/Sub allows, dead-letters a
-	// live request while a pool stays saturated, and no result is published.
+	// defaultDeliveryAttempts is the Pub/Sub maximum. A retry Nacks, and each
+	// Nack counts. A refusal keeps the message leased and does not. Five
+	// attempts, the minimum Pub/Sub allows, still dead-letters a live request
+	// that is retried while a pool stays saturated, and no result is published.
 	defaultDeliveryAttempts  = maxDeliveryAttempts
 	minRetryBackoff          = 10 * time.Second
 	maxRetryBackoff          = 600 * time.Second
@@ -32,6 +33,9 @@ const (
 	maxPubSubResourceIDLen   = 255
 	maxSubscriptionFilterLen = 256
 	resultReceiveBuffer      = 16
+	// receiveRestartBackoff keeps a caller that retries GetResult on every
+	// error from opening a new pair of StreamingPulls on each iteration.
+	receiveRestartBackoff = time.Second
 	// resultMaxExtension matches the Pub/Sub client default. GetResult holds a
 	// message until the caller takes it, but the lease is not extended past
 	// this, and a slower caller is redelivered a duplicate.
@@ -81,9 +85,10 @@ type Config struct {
 	// MaxDeliveryAttempts is how many times Pub/Sub delivers a request before
 	// dead-lettering it. Zero uses defaultDeliveryAttempts (100).
 	// Values outside 5-100 are rejected.
-	// The processor Nacks on gate refusal and on retry, and each Nack counts.
-	// An existing subscription keeps its dead-letter policy. Delete it once
-	// so the next NewProducer creates it with this value.
+	// The processor Nacks a retry, and each Nack counts. A refusal keeps the
+	// message leased on the same delivery and does not.
+	// An existing subscription keeps its dead-letter policy, including the
+	// topic. Delete it once so the next NewProducer creates it with this value.
 	MaxDeliveryAttempts int32
 }
 
@@ -103,6 +108,15 @@ func WithPubSubClient(client *pubsub.Client) Option {
 	}
 }
 
+// WithLogger records undecodable results and dead letters.
+// Without it those messages are still acknowledged and skipped, and the log is discarded.
+func WithLogger(logger logr.Logger) Option {
+	return func(p *Producer) error {
+		p.logger = logger
+		return nil
+	}
+}
+
 // WithoutCreateResources skips topic and subscription provisioning. Use this
 // when the caller has a publish-only identity or resources are managed elsewhere.
 func WithoutCreateResources() Option {
@@ -114,19 +128,12 @@ func WithoutCreateResources() Option {
 
 // Producer implements api.Producer against GCP Pub/Sub.
 type Producer struct {
-	client                   *pubsub.Client
-	managedClient            bool
-	publisher                *pubsub.Publisher
-	projectID                string
-	requestTopicID           string
-	requestSubscriptionID    string
-	resultTopicID            string
-	resultRoute              string
-	resultSubscriptionID     string
-	deadLetterTopicID        string
-	deadLetterSubscriptionID string
-	maxDeliveryAttempts      int32
-	createResources          bool
+	cfg             Config
+	client          *pubsub.Client
+	managedClient   bool
+	publisher       *pubsub.Publisher
+	logger          logr.Logger
+	createResources bool
 	// results is filled by one Receive. Messages stay unacked until GetResult
 	// takes them, so a crash redelivers anything still in this buffer.
 	results    chan receivedResult
@@ -137,9 +144,12 @@ type Producer struct {
 	receiving  bool
 	// stream is the receive currently in flight. Its error is set before done
 	// is closed and is never cleared, so the next stream cannot drop it.
-	stream    *resultStream
-	closeOnce sync.Once
-	closed    chan struct{}
+	stream *resultStream
+	// nextReceive is the earliest time a failed stream may be replaced.
+	// Zero means immediately.
+	nextReceive time.Time
+	closeOnce   sync.Once
+	closed      chan struct{}
 }
 
 // resultStream is one pair of result and dead-letter receives.
@@ -171,20 +181,13 @@ func NewProducer(ctx context.Context, cfg Config, opts ...Option) (*Producer, er
 
 	recvCtx, recvCancel := context.WithCancel(context.Background())
 	p := &Producer{
-		projectID:                cfg.ProjectID,
-		requestTopicID:           cfg.RequestTopicID,
-		requestSubscriptionID:    cfg.RequestSubscriptionID,
-		resultTopicID:            cfg.ResultTopicID,
-		resultRoute:              cfg.ResultRoute,
-		resultSubscriptionID:     cfg.ResultSubscriptionID,
-		deadLetterTopicID:        cfg.DeadLetterTopicID,
-		deadLetterSubscriptionID: cfg.DeadLetterSubscriptionID,
-		maxDeliveryAttempts:      cfg.MaxDeliveryAttempts,
-		createResources:          true,
-		results:                  make(chan receivedResult, resultReceiveBuffer),
-		recvCtx:                  recvCtx,
-		recvCancel:               recvCancel,
-		closed:                   make(chan struct{}),
+		cfg:             cfg,
+		logger:          logr.Discard(),
+		createResources: true,
+		results:         make(chan receivedResult, resultReceiveBuffer),
+		recvCtx:         recvCtx,
+		recvCancel:      recvCancel,
+		closed:          make(chan struct{}),
 	}
 
 	opened := false
@@ -221,7 +224,7 @@ func NewProducer(ctx context.Context, cfg Config, opts ...Option) (*Producer, er
 		}
 	}
 
-	p.publisher = p.client.Publisher(p.requestTopicID)
+	p.publisher = p.client.Publisher(p.cfg.RequestTopicID)
 	opened = true
 	return p, nil
 }
@@ -273,7 +276,7 @@ func (p *Producer) SubmitRequest(ctx context.Context, req api.Request) error {
 
 	_, err = p.publisher.Publish(ctx, &pubsub.Message{
 		Data:       data,
-		Attributes: map[string]string{api.ResultRouteAttribute: p.resultRoute},
+		Attributes: map[string]string{api.ResultRouteAttribute: p.cfg.ResultRoute},
 	}).Get(ctx)
 	if err != nil {
 		return fmt.Errorf("publish request: %w", err)
@@ -297,7 +300,8 @@ func (p *Producer) CancelRequests(_ context.Context, requestIDs []string) error 
 // only after this call takes it, and that ack is issued before the receive
 // returns. A message not taken within resultMaxExtension is redelivered.
 // If a receive returns an error, this call returns that error. The error stays
-// on that stream, and the next call starts a new one.
+// on that stream. The next call reuses it for receiveRestartBackoff, then
+// starts a new one.
 func (p *Producer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("failed to get result: %w", ctx.Err())
@@ -351,8 +355,9 @@ func takeResult(item receivedResult) (*api.ResultMessage, error) {
 }
 
 // ensureReceive starts the result and dead-letter receives unless they are
-// already running. A stream that returned an error keeps that error. The next
-// call starts another stream instead of clearing it.
+// already running. A stream that returned an error keeps that error.
+// The next call reuses it until receiveRestartBackoff has elapsed, then
+// starts another stream instead of clearing the error.
 func (p *Producer) ensureReceive() *resultStream {
 	p.recvMu.Lock()
 	defer p.recvMu.Unlock()
@@ -362,6 +367,11 @@ func (p *Producer) ensureReceive() *resultStream {
 	default:
 	}
 	if p.receiving {
+		return p.stream
+	}
+	// A failed stream is reused until the backoff elapses. Starting a new
+	// Receive here would open two StreamingPulls on every caller retry.
+	if p.stream != nil && time.Now().Before(p.nextReceive) {
 		return p.stream
 	}
 	p.receiving = true
@@ -382,6 +392,7 @@ func (p *Producer) receiveResults(ctx context.Context, stream *resultStream) {
 	p.receiving = false
 	if err != nil && ctx.Err() == nil {
 		stream.err = err
+		p.nextReceive = time.Now().Add(receiveRestartBackoff)
 	}
 	p.recvMu.Unlock()
 }
@@ -396,8 +407,8 @@ func (p *Producer) receiveSubscriptions(ctx context.Context) error {
 		id string
 		fn func(context.Context, *pubsub.Message)
 	}{
-		{p.resultSubscriptionID, p.enqueueResult},
-		{p.deadLetterSubscriptionID, p.enqueueDeadLetter},
+		{p.cfg.ResultSubscriptionID, p.enqueueResult},
+		{p.cfg.DeadLetterSubscriptionID, p.enqueueDeadLetter},
 	}
 	for _, sub := range subs {
 		wg.Add(1)
@@ -442,12 +453,11 @@ func (p *Producer) enqueueDeadLetter(ctx context.Context, msg *pubsub.Message) {
 // client, so the callback stays inside Receive until the handoff settles.
 func (p *Producer) deliver(ctx context.Context, msg *pubsub.Message, item receivedResult) {
 	if item.err != nil {
-		// Poison is acked here so it is not redelivered.
+		// Poison is acked and skipped. Surfacing it from GetResult stops a
+		// caller that returns on the first non-context error, and the rest
+		// of the subscription is then left unconsumed.
 		msg.Ack()
-		select {
-		case p.results <- item:
-		case <-ctx.Done():
-		}
+		p.logger.Error(item.err, "skipping undecodable message", "id", msg.ID)
 		return
 	}
 
