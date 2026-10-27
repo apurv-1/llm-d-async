@@ -172,6 +172,25 @@ func NewGateDroppedResult(req Request, routing InternalRouting) ResultMessage {
 	return NewErrorResult(req, routing, ErrCodeGateDropped, "Pool gating dropped request")
 }
 
+// BackfillResultMetadata returns a new map containing request metadata, then
+// result metadata. A key the result left out is filled from the request.
+// A key the result set wins. Both empty returns nil.
+// Drop paths use this so a gate that built its own result still carries
+// result_route and the rest of the request metadata.
+func BackfillResultMetadata(request, result map[string]string) map[string]string {
+	if len(request) == 0 && len(result) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(request)+len(result))
+	for k, v := range request {
+		merged[k] = v
+	}
+	for k, v := range result {
+		merged[k] = v
+	}
+	return merged
+}
+
 // NewDeadlineExceededResult builds a ResultMessage for deadline expiry.
 func NewDeadlineExceededResult(req Request, routing InternalRouting) ResultMessage {
 	return NewErrorResult(req, routing, ErrCodeDeadlineExceeded, "deadline exceeded")

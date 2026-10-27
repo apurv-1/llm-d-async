@@ -213,6 +213,7 @@ func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristi
 							var resultMsg asyncapi.ResultMessage
 							if verdict.Result != nil {
 								resultMsg = *verdict.Result
+								resultMsg.Metadata = asyncapi.BackfillResultMetadata(msg.PublicRequest.ReqMetadata(), verdict.Result.Metadata)
 							} else {
 								resultMsg = asyncapi.NewGateDroppedResult(msg.PublicRequest, msg.InternalRouting)
 							}

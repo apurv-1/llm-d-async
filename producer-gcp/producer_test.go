@@ -12,6 +12,7 @@ import (
 	"cloud.google.com/go/pubsub/v2"
 	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"cloud.google.com/go/pubsub/v2/pstest"
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/api"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
@@ -232,7 +233,7 @@ func TestNewProducerCreatesResources(t *testing.T) {
 	}
 
 	resSub, err := client.SubscriptionAdminClient.GetSubscription(ctx, &pubsubpb.GetSubscriptionRequest{
-		Subscription: subscriptionResource(testProject, p.resultSubscriptionID),
+		Subscription: subscriptionResource(testProject, p.cfg.ResultSubscriptionID),
 	})
 	if err != nil {
 		t.Fatalf("get result subscription: %v", err)
@@ -296,6 +297,26 @@ func TestNewProducerRejectsTopicMismatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "attached to topic") {
 		t.Errorf("error = %q, want topic mismatch", err)
+	}
+}
+
+func TestNewProducerRejectsMissingDeadLetterPolicy(t *testing.T) {
+	client := newFakeClient(t)
+	ctx := context.Background()
+	cfg := testConfig()
+	if _, err := client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: topicResource(testProject, cfg.RequestTopicID)}); err != nil {
+		t.Fatalf("create request topic: %v", err)
+	}
+	if _, err := client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name:  subscriptionResource(testProject, cfg.RequestSubscriptionID),
+		Topic: topicResource(testProject, cfg.RequestTopicID),
+	}); err != nil {
+		t.Fatalf("create request subscription: %v", err)
+	}
+
+	_, err := NewProducer(context.Background(), cfg, WithPubSubClient(client))
+	if err == nil || !strings.Contains(err.Error(), "dead-letters") {
+		t.Fatalf("error = %v, want dead-letter topic mismatch", err)
 	}
 }
 
@@ -542,7 +563,7 @@ func TestResultRouteWithExplicitSubscriptionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get result subscription: %v", err)
 	}
-	if resSub.GetFilter() != resultRouteFilter(p.resultRoute) {
+	if resSub.GetFilter() != resultRouteFilter(p.cfg.ResultRoute) {
 		t.Errorf("filter = %q", resSub.GetFilter())
 	}
 }
@@ -730,7 +751,7 @@ func TestGetResultSurfacesDeadLetter(t *testing.T) {
 		}
 	}
 
-	publishDeadLetter(t, client, a.deadLetterTopicID, "poisoned", a.resultRoute)
+	publishDeadLetter(t, client, a.cfg.DeadLetterTopicID, "poisoned", a.cfg.ResultRoute)
 	getCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	got, err := a.GetResult(getCtx)
@@ -782,7 +803,8 @@ func TestReceiveErrorSurvivesRestart(t *testing.T) {
 
 func TestPoisonResultIsAcked(t *testing.T) {
 	client, srv := newFake(t)
-	p := newTestProducer(t, client, testConfig())
+	sink := &countLogSink{}
+	p := newTestProducer(t, client, testConfig(), WithLogger(logr.New(sink)))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -794,20 +816,70 @@ func TestPoisonResultIsAcked(t *testing.T) {
 	}).Get(ctx); err != nil {
 		t.Fatalf("publish poison: %v", err)
 	}
+	publishResult(t, client, "results", "good", "producer-a")
 
-	_, err := p.GetResult(ctx)
-	if err == nil || !strings.Contains(err.Error(), "unmarshal") {
-		t.Fatalf("GetResult = %v, want unmarshal error", err)
+	result, err := p.GetResult(ctx)
+	if err != nil {
+		t.Fatalf("GetResult: %v", err)
+	}
+	if result.ID != "good" {
+		t.Fatalf("result id = %q, want good", result.ID)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		acked, _ := resultRouteStats(srv, "producer-a")
-		if acked == 1 {
+		if acked == 2 && sink.count() == 1 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("poison acks = %d, want 1", acked)
+			t.Fatalf("acks = %d, log skips = %d, want 2 acks and 1 skip", acked, sink.count())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+func TestReceiveRestartBacksOff(t *testing.T) {
+	client := newFakeClient(t)
+	p := newTestProducer(t, client, testConfig(), WithoutCreateResources())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := p.GetResult(ctx); err == nil {
+		t.Fatal("expected receive error")
+	}
+
+	p.recvMu.Lock()
+	receiving := p.receiving
+	next := p.nextReceive
+	stream := p.stream
+	p.recvMu.Unlock()
+	if receiving {
+		t.Fatal("receiving still set after the stream error")
+	}
+	if stream == nil || !time.Now().Before(next) {
+		t.Fatalf("stream=%v nextReceive=%v, want the failed stream and a future backoff", stream, next)
+	}
+
+	if _, err := p.GetResult(ctx); err == nil {
+		t.Fatal("second GetResult returned nil, want the previous receive error")
+	}
+	p.recvMu.Lock()
+	defer p.recvMu.Unlock()
+	if p.receiving || p.stream != stream || !p.nextReceive.Equal(next) {
+		t.Fatalf("receiving=%v sameStream=%v nextReceive=%v, want the failed stream reused", p.receiving, p.stream == stream, p.nextReceive)
+	}
+}
+
+// countLogSink counts Error calls. GetResult's receive logs from another goroutine.
+type countLogSink struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (s *countLogSink) Init(logr.RuntimeInfo)          {}
+func (s *countLogSink) Enabled(int) bool               { return true }
+func (s *countLogSink) Info(int, string, ...any)       {}
+func (s *countLogSink) WithValues(...any) logr.LogSink { return s }
+func (s *countLogSink) WithName(string) logr.LogSink   { return s }
+func (s *countLogSink) Error(error, string, ...any)    { s.mu.Lock(); s.n++; s.mu.Unlock() }
+func (s *countLogSink) count() int                     { s.mu.Lock(); defer s.mu.Unlock(); return s.n }
